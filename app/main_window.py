@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -15,6 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
@@ -24,35 +23,25 @@ from PySide6.QtWidgets import (
 
 from .models import ParsedLog, SignalNode
 from .parser import ParseError, parse_log_file
+from .plot_panels import BasePlotPanel, Plot2DPanel, Plot3DPanel
 
 
 class MainWindow(QMainWindow):
-    COLORS = [
-        "#1f77b4",
-        "#d62728",
-        "#2ca02c",
-        "#ff7f0e",
-        "#9467bd",
-        "#8c564b",
-        "#17becf",
-        "#e377c2",
-        "#7f7f7f",
-        "#bcbd22",
-    ]
-
     def __init__(self, initial_path: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle("机器人状态曲线查看器")
-        self.resize(1400, 860)
+        self.resize(1580, 920)
 
         self.parsed_log: ParsedLog | None = None
         self.signal_lookup: dict[str, SignalNode] = {}
-        self.plot_items: dict[str, pg.PlotDataItem] = {}
-        self.legend: pg.LegendItem | None = None
+        self.signal_item_map: dict[str, QTreeWidgetItem] = {}
+        self.panels: list[BasePlotPanel] = []
+        self.active_panel: BasePlotPanel | None = None
         self._suppress_item_changed = False
         self._initial_path = initial_path
 
         self._build_ui()
+        self.add_panel("xt")
 
         if self._initial_path is not None:
             self.load_file(self._initial_path)
@@ -71,12 +60,28 @@ class MainWindow(QMainWindow):
         self.open_button = QPushButton("打开文件")
         self.clear_button = QPushButton("清空选择")
         self.reset_button = QPushButton("重置视图")
+        self.add_xt_button = QPushButton("新增 X-T 图")
+        self.add_xy_button = QPushButton("新增 X-Y 图")
+        self.add_xyz_button = QPushButton("新增 XYZ 图")
+        self.remove_panel_button = QPushButton("关闭当前图")
+        self.zoom_x_button = QPushButton("滚轮缩放 X")
+        self.zoom_y_button = QPushButton("滚轮缩放 Y")
+        self.zoom_xy_button = QPushButton("滚轮缩放 XY")
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索字段，例如 J1 / Tcp / ErrCode")
+        for button in (self.zoom_x_button, self.zoom_y_button, self.zoom_xy_button):
+            button.setCheckable(True)
 
         controls_layout.addWidget(self.open_button)
         controls_layout.addWidget(self.clear_button)
         controls_layout.addWidget(self.reset_button)
+        controls_layout.addWidget(self.add_xt_button)
+        controls_layout.addWidget(self.add_xy_button)
+        controls_layout.addWidget(self.add_xyz_button)
+        controls_layout.addWidget(self.remove_panel_button)
+        controls_layout.addWidget(self.zoom_x_button)
+        controls_layout.addWidget(self.zoom_y_button)
+        controls_layout.addWidget(self.zoom_xy_button)
         controls_layout.addWidget(self.search_input, 1)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -87,33 +92,20 @@ class MainWindow(QMainWindow):
         self.tree.setUniformRowHeights(True)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
 
-        self.plot_widget = pg.PlotWidget(background="w")
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
-        self.plot_widget.setLabel("bottom", "相对时间", units="s")
-        self.plot_widget.setLabel("left", "数值")
-        self.plot_widget.getPlotItem().setClipToView(True)
-        self.plot_widget.getPlotItem().setDownsampling(mode="peak")
-        self.plot_widget.getViewBox().setMouseMode(pg.ViewBox.RectMode)
-        self.plot_widget.setMouseEnabled(x=True, y=True)
-
-        self.legend = self.plot_widget.addLegend(offset=(10, 10))
-        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#555555", width=1))
-        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#999999", width=1, style=Qt.DashLine))
-        self.plot_widget.addItem(self.v_line, ignoreBounds=True)
-        self.plot_widget.addItem(self.h_line, ignoreBounds=True)
-        self.v_line.hide()
-        self.h_line.hide()
-        self.mouse_proxy = pg.SignalProxy(
-            self.plot_widget.scene().sigMouseMoved,
-            rateLimit=60,
-            slot=self._on_mouse_moved,
-        )
+        self.panel_scroll = QScrollArea()
+        self.panel_scroll.setWidgetResizable(True)
+        self.panel_container = QWidget()
+        self.panel_layout = QVBoxLayout(self.panel_container)
+        self.panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.panel_layout.setSpacing(10)
+        self.panel_layout.addStretch(1)
+        self.panel_scroll.setWidget(self.panel_container)
 
         splitter.addWidget(self.tree)
-        splitter.addWidget(self.plot_widget)
+        splitter.addWidget(self.panel_scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([360, 1040])
+        splitter.setSizes([360, 1220])
 
         root_layout.addLayout(controls_layout)
         root_layout.addWidget(splitter, 1)
@@ -127,7 +119,15 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self.open_file_dialog)
         self.clear_button.clicked.connect(self.clear_selection)
         self.reset_button.clicked.connect(self.reset_view)
+        self.add_xt_button.clicked.connect(lambda: self.add_panel("xt"))
+        self.add_xy_button.clicked.connect(lambda: self.add_panel("xy"))
+        self.add_xyz_button.clicked.connect(lambda: self.add_panel("xyz"))
+        self.remove_panel_button.clicked.connect(self.remove_active_panel)
+        self.zoom_x_button.clicked.connect(lambda: self.set_zoom_mode("x"))
+        self.zoom_y_button.clicked.connect(lambda: self.set_zoom_mode("y"))
+        self.zoom_xy_button.clicked.connect(lambda: self.set_zoom_mode("xy"))
         self.search_input.textChanged.connect(self.apply_filter)
+        self.set_zoom_mode("xy")
 
     def open_file_dialog(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -152,7 +152,11 @@ class MainWindow(QMainWindow):
         self.parsed_log = parsed
         self.signal_lookup = {signal.signal_id: signal for signal in parsed.signals}
         self._populate_tree(parsed.signals)
-        self._refresh_plot()
+        for panel in self.panels:
+            panel.selected_signal_ids = [signal_id for signal_id in panel.selected_signal_ids if signal_id in self.signal_lookup]
+            panel.update_plot(self.parsed_log, self.signal_lookup)
+        if self.active_panel is not None:
+            self._sync_tree_from_active_panel()
 
         self.info_label.setText(
             "文件: "
@@ -174,6 +178,7 @@ class MainWindow(QMainWindow):
     def _populate_tree(self, signals: list[SignalNode]) -> None:
         self._suppress_item_changed = True
         self.tree.clear()
+        self.signal_item_map.clear()
 
         created_items: dict[tuple[str, ...], QTreeWidgetItem] = {}
 
@@ -199,6 +204,7 @@ class MainWindow(QMainWindow):
                     item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
                     item.setCheckState(0, Qt.Unchecked)
                     item.setToolTip(0, signal.full_path)
+                    self.signal_item_map[signal.signal_id] = item
                     if not signal.available:
                         item.setDisabled(True)
                         item.setText(0, f"{part} (无数据列)")
@@ -208,81 +214,125 @@ class MainWindow(QMainWindow):
 
         self._suppress_item_changed = False
         self.apply_filter(self.search_input.text())
+        self._sync_tree_from_active_panel()
 
-    def _checked_signal_ids(self) -> list[str]:
-        checked_ids: list[str] = []
+    def add_panel(self, mode: str) -> None:
+        if mode == "xyz":
+            panel: BasePlotPanel = Plot3DPanel(self.set_active_panel, self.remove_panel)
+        else:
+            panel = Plot2DPanel(mode, self.set_active_panel, self.remove_panel)
+        panel.set_status_callback(lambda text, owner=panel: self._update_panel_status(owner, text))
+        insert_index = max(self.panel_layout.count() - 1, 0)
+        self.panel_layout.insertWidget(insert_index, panel)
+        self.panels.append(panel)
+        self._update_panel_titles()
+        panel.update_plot(self.parsed_log, self.signal_lookup)
+        self.set_active_panel(panel)
 
-        def visit(item: QTreeWidgetItem) -> None:
-            signal_id = item.data(0, Qt.UserRole)
-            if signal_id and item.checkState(0) == Qt.Checked and item.isDisabled() is False:
-                checked_ids.append(signal_id)
-            for child_index in range(item.childCount()):
-                visit(item.child(child_index))
+    def remove_panel(self, panel: BasePlotPanel) -> None:
+        if panel not in self.panels:
+            return
+        self.panels.remove(panel)
+        panel.setParent(None)
+        panel.deleteLater()
+        if not self.panels:
+            self.add_panel("xt")
+            return
+        self._update_panel_titles()
+        if self.active_panel is panel:
+            self.set_active_panel(self.panels[max(len(self.panels) - 1, 0)])
 
-        for index in range(self.tree.topLevelItemCount()):
-            visit(self.tree.topLevelItem(index))
+    def remove_active_panel(self) -> None:
+        if self.active_panel is not None:
+            self.remove_panel(self.active_panel)
 
-        return checked_ids
+    def _update_panel_titles(self) -> None:
+        mode_names = {"xt": "X-T", "xy": "X-Y", "xyz": "XYZ"}
+        for index, panel in enumerate(self.panels, start=1):
+            panel.set_panel_title(f"图 {index} · {mode_names.get(panel.mode, panel.mode.upper())}")
 
-    def _refresh_plot(self) -> None:
-        for item in self.plot_items.values():
-            self.plot_widget.removeItem(item)
-        self.plot_items.clear()
+    def set_active_panel(self, panel: BasePlotPanel) -> None:
+        if panel not in self.panels:
+            return
+        self.active_panel = panel
+        for current in self.panels:
+            current.set_active(current is panel)
+        self._sync_tree_from_active_panel()
+        self.set_zoom_mode(self._current_zoom_mode())
+        self.cursor_label.setText("当前图已切换，可在左侧重新选择轴")
 
-        if self.legend is not None:
-            self.legend.clear()
-
-        if self.parsed_log is None:
-            self.v_line.hide()
-            self.h_line.hide()
+    def _sync_tree_from_active_panel(self) -> None:
+        if self.active_panel is None:
             return
 
-        for order, signal_id in enumerate(self._checked_signal_ids()):
-            signal = self.signal_lookup.get(signal_id)
-            if signal is None:
+        self._suppress_item_changed = True
+        selected = set(self.active_panel.selected_signal_ids)
+        for signal_id, item in self.signal_item_map.items():
+            if item.isDisabled():
                 continue
-
-            curve = self.plot_widget.plot(
-                self.parsed_log.time_seconds,
-                self.parsed_log.get_series(signal_id),
-                pen=pg.mkPen(self.COLORS[order % len(self.COLORS)], width=2),
-                name=signal.full_path,
-            )
-            self.plot_items[signal_id] = curve
-
-        has_curves = bool(self.plot_items)
-        self.v_line.setVisible(has_curves)
-        self.h_line.setVisible(has_curves)
+            item.setCheckState(0, Qt.Checked if signal_id in selected else Qt.Unchecked)
+        self._suppress_item_changed = False
 
     def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column != 0 or self._suppress_item_changed:
             return
-        if not item.data(0, Qt.UserRole):
+        signal_id = item.data(0, Qt.UserRole)
+        if not signal_id or self.active_panel is None:
             return
-        self._refresh_plot()
-        self.reset_view()
+
+        checked = item.checkState(0) == Qt.Checked
+        selection = list(self.active_panel.selected_signal_ids)
+        limit = self.active_panel.selection_limit
+
+        if checked:
+            if signal_id not in selection:
+                if limit is not None and len(selection) >= limit:
+                    removed_signal_id = selection.pop(0)
+                    removed_item = self.signal_item_map.get(removed_signal_id)
+                    if removed_item is not None:
+                        self._suppress_item_changed = True
+                        removed_item.setCheckState(0, Qt.Unchecked)
+                        self._suppress_item_changed = False
+                selection.append(signal_id)
+        else:
+            selection = [current for current in selection if current != signal_id]
+
+        self.active_panel.selected_signal_ids = selection
+        self.active_panel.update_plot(self.parsed_log, self.signal_lookup)
+        self.active_panel.reset_view()
 
     def clear_selection(self) -> None:
+        if self.active_panel is None:
+            return
+        self.active_panel.selected_signal_ids = []
         self._suppress_item_changed = True
 
-        def visit(item: QTreeWidgetItem) -> None:
-            if item.data(0, Qt.UserRole) and item.isDisabled() is False:
+        for item in self.signal_item_map.values():
+            if item.isDisabled() is False:
                 item.setCheckState(0, Qt.Unchecked)
-            for child_index in range(item.childCount()):
-                visit(item.child(child_index))
-
-        for index in range(self.tree.topLevelItemCount()):
-            visit(self.tree.topLevelItem(index))
 
         self._suppress_item_changed = False
-        self._refresh_plot()
+        self.active_panel.update_plot(self.parsed_log, self.signal_lookup)
         self.cursor_label.setText("未选择曲线")
 
     def reset_view(self) -> None:
-        if self.parsed_log is None:
+        if self.parsed_log is None or self.active_panel is None:
             return
-        self.plot_widget.enableAutoRange()
-        self.plot_widget.autoRange()
+        self.active_panel.reset_view()
+
+    def set_zoom_mode(self, mode: str) -> None:
+        self.zoom_x_button.setChecked(mode == "x")
+        self.zoom_y_button.setChecked(mode == "y")
+        self.zoom_xy_button.setChecked(mode == "xy")
+        if self.active_panel is not None:
+            self.active_panel.set_zoom_mode(mode)
+
+    def _current_zoom_mode(self) -> str:
+        if self.zoom_x_button.isChecked():
+            return "x"
+        if self.zoom_y_button.isChecked():
+            return "y"
+        return "xy"
 
     def apply_filter(self, text: str) -> None:
         query = text.strip().lower()
@@ -305,46 +355,12 @@ class MainWindow(QMainWindow):
         for index in range(self.tree.topLevelItemCount()):
             filter_item(self.tree.topLevelItem(index))
 
-    def _on_mouse_moved(self, event: tuple[object]) -> None:
-        if self.parsed_log is None or not self.plot_items:
-            self.cursor_label.setText("未选择曲线")
-            return
-
-        scene_pos = event[0]
-        if not self.plot_widget.sceneBoundingRect().contains(scene_pos):
-            return
-
-        mouse_point = self.plot_widget.getPlotItem().vb.mapSceneToView(scene_pos)
-        x_value = float(mouse_point.x())
-        times = self.parsed_log.time_seconds
-        index = int(np.searchsorted(times, x_value))
-        if index >= len(times):
-            index = len(times) - 1
-        elif index > 0 and abs(times[index - 1] - x_value) <= abs(times[index] - x_value):
-            index -= 1
-
-        nearest_x = float(times[index])
-        self.v_line.setPos(nearest_x)
-
-        y_value = None
-        preview_parts = [f"t={nearest_x:.4f}s"]
-        for signal_id in list(self.plot_items)[:3]:
-            signal = self.signal_lookup.get(signal_id)
-            if signal is None:
-                continue
-            value = float(self.parsed_log.get_series(signal_id)[index])
-            if y_value is None:
-                y_value = value
-            preview_parts.append(f"{signal.name}={value:.6f}")
-
-        if y_value is not None:
-            self.h_line.setPos(y_value)
-
-        self.cursor_label.setText(" | ".join(preview_parts))
+    def _update_panel_status(self, panel: BasePlotPanel, text: str) -> None:
+        if panel is self.active_panel:
+            self.cursor_label.setText(text)
 
 
 def launch_app(initial_path: Path | None = None) -> int:
-    pg.setConfigOptions(antialias=True)
     app = QApplication.instance() or QApplication([])
     window = MainWindow(initial_path=initial_path)
     window.show()
