@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import html
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import (
     QFrame,
@@ -92,7 +93,7 @@ class BasePlotPanel(QFrame):
         self.active_label.setStyleSheet("color: #1f6feb; font-weight: 700;")
         self.active_label.hide()
         self.activate_button = QPushButton("设为当前图")
-        self.remove_button = QPushButton("关闭")
+        self.remove_button = QPushButton("关闭此图")
 
         header_layout.addWidget(self.title_label)
         header_layout.addWidget(self.detail_label, 1)
@@ -101,7 +102,7 @@ class BasePlotPanel(QFrame):
         header_layout.addWidget(self.remove_button)
         layout.addLayout(header_layout)
 
-        self.message_label = QLabel("未加载数据")
+        self.message_label = QLabel("No data loaded")
         self.message_label.setStyleSheet("color: #666666;")
         layout.addWidget(self.message_label)
 
@@ -150,6 +151,8 @@ class BasePlotPanel(QFrame):
                 """
             )
         self.active_label.setVisible(active)
+        self.activate_button.setVisible(not active)
+        self.activate_button.setEnabled(not active)
 
     def set_zoom_mode(self, mode: str) -> None:
         del mode
@@ -173,6 +176,7 @@ class Plot2DPanel(BasePlotPanel):
         self.parsed_log: ParsedLog | None = None
         self.signal_lookup: dict[str, SignalNode] = {}
         self._default_ranges: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._cursor_sync_callback: Callable[[int | None], None] | None = None
 
         self.plot_widget = AxisZoomPlotWidget(background="w")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
@@ -180,14 +184,18 @@ class Plot2DPanel(BasePlotPanel):
         self.plot_widget.getPlotItem().setDownsampling(mode="peak")
         self.plot_widget.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.plot_widget.setMouseEnabled(x=True, y=True)
-        self.legend = self.plot_widget.addLegend(offset=(10, 10))
+
+        self.legend = None
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#555555", width=1))
-        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#999999", width=1, style=Qt.DashLine))
+        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#999999", width=1, style=Qt.PenStyle.DashLine))
         self.plot_widget.addItem(self.v_line, ignoreBounds=True)
         self.plot_widget.addItem(self.h_line, ignoreBounds=True)
-        self.v_line.hide()
-        self.h_line.hide()
+        self.v_line.setZValue(20)
+        self.h_line.setZValue(19)
+        self._hide_cursor()
+
         self.content_layout.addWidget(self.plot_widget, 1)
+
         self.value_overlay = QLabel(self.plot_widget)
         self.value_overlay.setStyleSheet(
             """
@@ -201,13 +209,16 @@ class Plot2DPanel(BasePlotPanel):
             }
             """
         )
-        self.value_overlay.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.value_overlay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.value_overlay.setWordWrap(True)
         self.value_overlay.setMinimumWidth(220)
-        self._set_overlay_text("当前值会显示在这里")
-        self.value_overlay.move(12, 12)
+        self.value_overlay.setMaximumWidth(320)
+        self._set_overlay_text("Values will appear here")
         self.value_overlay.raise_()
         self.value_overlay.show()
+
+        self.plot_widget.installEventFilter(self)
+        self.plot_widget.viewport().installEventFilter(self)
 
         self.mouse_proxy = pg.SignalProxy(
             self.plot_widget.scene().sigMouseMoved,
@@ -225,18 +236,64 @@ class Plot2DPanel(BasePlotPanel):
 
     def set_zoom_mode(self, mode: str) -> None:
         self.plot_widget.set_zoom_mode(mode)
-        self.detail_label.setText(f"滚轮缩放: {mode.upper()}")
+        self.detail_label.setText(f"Zoom wheel: {mode.upper()}")
+
+    def set_cursor_sync_callback(self, callback: Callable[[int | None], None]) -> None:
+        self._cursor_sync_callback = callback
+
+    @staticmethod
+    def _display_signal_label(signal: SignalNode) -> str:
+        if len(signal.path_parts) > 1:
+            return " / ".join(signal.path_parts[1:])
+        return signal.full_path
+
+    @staticmethod
+    def _series_color(index: int) -> str:
+        return MainPalette.colors[index % len(MainPalette.colors)]
+
+    def _format_overlay_rows(self, rows: list[tuple[str, float, str]]) -> str:
+        html_rows = []
+        for label, value, color in rows:
+            safe_label = html.escape(label)
+            html_rows.append(
+                f"<span style='color:{color}; font-weight:600;'>{safe_label}</span>: "
+                f"<span>{value:.6f}</span>"
+            )
+        return "<br>".join(html_rows) if html_rows else "No values"
 
     def _clear_curves(self) -> None:
         for curve in self.curves:
             self.plot_widget.removeItem(curve)
         self.curves.clear()
-        self.legend.clear()
+        if self.legend is not None:
+            self.legend.clear()
         self._default_ranges = None
+        self._hide_cursor()
 
     def _set_overlay_text(self, text: str) -> None:
         self.value_overlay.setText(text)
         self.value_overlay.adjustSize()
+        self._reposition_overlay()
+
+    def _reposition_overlay(self) -> None:
+        margin = 12
+        x_pos = max(self.plot_widget.width() - self.value_overlay.width() - margin, margin)
+        self.value_overlay.move(x_pos, margin)
+
+    def _hide_cursor(self, *, broadcast: bool = False) -> None:
+        self.v_line.hide()
+        self.h_line.hide()
+        if broadcast and self._cursor_sync_callback is not None:
+            self._cursor_sync_callback(None)
+        if hasattr(self, "plot_widget"):
+            self.plot_widget.viewport().update()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.plot_widget and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
+            self._reposition_overlay()
+        elif watched is self.plot_widget.viewport() and event.type() in {QEvent.Type.Leave, QEvent.Type.Hide}:
+            self._hide_cursor(broadcast=True)
+        return super().eventFilter(watched, event)
 
     @staticmethod
     def _compute_padded_range(min_value: float, max_value: float) -> tuple[float, float]:
@@ -266,10 +323,8 @@ class Plot2DPanel(BasePlotPanel):
         self._clear_curves()
 
         if parsed_log is None:
-            self.message_label.setText("未加载数据")
-            self.v_line.hide()
-            self.h_line.hide()
-            self._set_overlay_text("未加载数据")
+            self.message_label.setText("No data loaded")
+            self._set_overlay_text("No data loaded")
             return
 
         if self.mode == "xt":
@@ -278,14 +333,12 @@ class Plot2DPanel(BasePlotPanel):
             self._update_xy_plot(parsed_log, signal_lookup)
 
     def _update_xt_plot(self, parsed_log: ParsedLog, signal_lookup: dict[str, SignalNode]) -> None:
-        self.plot_widget.setLabel("bottom", "相对时间", units="s")
-        self.plot_widget.setLabel("left", "数值")
+        self.plot_widget.setLabel("bottom", "Relative Time", units="s")
+        self.plot_widget.setLabel("left", "Value")
 
         if not self.selected_signal_ids:
-            self.message_label.setText("请勾选一个或多个信号，绘制 X-T 曲线。")
-            self.v_line.hide()
-            self.h_line.hide()
-            self._set_overlay_text("X-T 图等待信号选择")
+            self.message_label.setText("Select one or more signals to draw an X-T plot.")
+            self._set_overlay_text("X-T plot is waiting for signal selection")
             return
 
         all_series: list[np.ndarray] = []
@@ -297,30 +350,30 @@ class Plot2DPanel(BasePlotPanel):
             curve = self.plot_widget.plot(
                 parsed_log.time_seconds,
                 series,
-                pen=pg.mkPen(MainPalette.colors[order % len(MainPalette.colors)], width=2),
-                name=signal.full_path,
+                pen=pg.mkPen(self._series_color(order), width=2),
+                name=self._display_signal_label(signal),
             )
             self.curves.append(curve)
             all_series.append(series)
 
-        self.message_label.setText(f"X-T 图: 时间对 {len(self.curves)} 条信号")
-        self.v_line.setVisible(bool(self.curves))
-        self.h_line.setVisible(bool(self.curves))
+        self.message_label.setText(f"X-T plot with {len(self.curves)} signal(s)")
         if all_series:
             combined = np.concatenate(all_series)
             self._set_default_ranges(parsed_log.time_seconds, combined)
-        first_signal = signal_lookup[self.selected_signal_ids[0]]
-        first_value = float(parsed_log.get_series(self.selected_signal_ids[0])[0])
-        self._set_overlay_text(f"t=0.0000s\n{first_signal.name}={first_value:.6f}")
+            first_signal = signal_lookup[self.selected_signal_ids[0]]
+            first_value = float(parsed_log.get_series(self.selected_signal_ids[0])[0])
+            self._set_overlay_text(
+                self._format_overlay_rows(
+                    [(self._display_signal_label(first_signal), first_value, self._series_color(0))]
+                )
+            )
 
     def _update_xy_plot(self, parsed_log: ParsedLog, signal_lookup: dict[str, SignalNode]) -> None:
         if len(self.selected_signal_ids) != 2:
             self.plot_widget.setLabel("bottom", "X")
             self.plot_widget.setLabel("left", "Y")
-            self.message_label.setText("请为当前 X-Y 图勾选 2 个信号，顺序为 X 后 Y。")
-            self.v_line.hide()
-            self.h_line.hide()
-            self._set_overlay_text("X-Y 图等待 2 个信号")
+            self.message_label.setText("Select exactly two signals for the current X-Y plot.")
+            self._set_overlay_text("X-Y plot is waiting for 2 selected signals")
             return
 
         x_signal_id, y_signal_id = self.selected_signal_ids
@@ -329,33 +382,57 @@ class Plot2DPanel(BasePlotPanel):
         x_series = parsed_log.get_series(x_signal_id)
         y_series = parsed_log.get_series(y_signal_id)
 
-        self.plot_widget.setLabel("bottom", x_signal.full_path)
-        self.plot_widget.setLabel("left", y_signal.full_path)
+        x_label = self._display_signal_label(x_signal)
+        y_label = self._display_signal_label(y_signal)
+        self.plot_widget.setLabel("bottom", x_label)
+        self.plot_widget.setLabel("left", y_label)
         curve = self.plot_widget.plot(
             x_series,
             y_series,
             pen=pg.mkPen(MainPalette.colors[0], width=2),
-            name=f"{y_signal.name} vs {x_signal.name}",
+            name=f"{y_label} vs {x_label}",
         )
         self.curves.append(curve)
-        self.message_label.setText(f"X-Y 图: X={x_signal.name} | Y={y_signal.name}")
-        self.v_line.show()
-        self.h_line.show()
+        self.message_label.setText(f"X-Y plot: X={x_label} | Y={y_label}")
         self._set_default_ranges(x_series, y_series)
         self._set_overlay_text(
-            f"X={x_signal.name}: {float(x_series[0]):.6f}\nY={y_signal.name}: {float(y_series[0]):.6f}"
+            self._format_overlay_rows(
+                [
+                    (f"X - {x_label}", float(x_series[0]), self._series_color(0)),
+                    (f"Y - {y_label}", float(y_series[0]), self._series_color(1)),
+                ]
+            )
         )
 
     def reset_view(self) -> None:
         self._apply_default_ranges()
 
+    def sync_cursor_to_index(self, index: int | None) -> None:
+        if index is None or self.parsed_log is None or not self.curves:
+            self._hide_cursor()
+            return
+
+        sample_count = self.parsed_log.time_seconds.shape[0]
+        if sample_count == 0:
+            self._hide_cursor()
+            return
+
+        clamped_index = max(0, min(index, sample_count - 1))
+        if self.mode == "xt":
+            self._show_xt_cursor_at_index(clamped_index)
+        else:
+            self._show_xy_cursor_at_index(clamped_index)
+
     def _on_mouse_moved(self, event: tuple[object]) -> None:
         if self.parsed_log is None or not self.curves:
-            self.emit_status("当前图还没有可显示的数据")
+            self.emit_status("No visible data in the current plot")
+            self._hide_cursor(broadcast=True)
             return
 
         scene_pos = event[0]
-        if not self.plot_widget.sceneBoundingRect().contains(scene_pos):
+        view_rect = self.plot_widget.getPlotItem().vb.sceneBoundingRect()
+        if not view_rect.contains(scene_pos):
+            self._hide_cursor(broadcast=True)
             return
 
         mouse_point = self.plot_widget.getPlotItem().vb.mapSceneToView(scene_pos)
@@ -373,8 +450,13 @@ class Plot2DPanel(BasePlotPanel):
             index = len(times) - 1
         elif index > 0 and abs(times[index - 1] - x_value) <= abs(times[index] - x_value):
             index -= 1
+        self._show_xt_cursor_at_index(index)
+        if self._cursor_sync_callback is not None:
+            self._cursor_sync_callback(index)
 
-        nearest_x = float(times[index])
+    def _show_xt_cursor_at_index(self, index: int) -> None:
+        assert self.parsed_log is not None
+        nearest_x = float(self.parsed_log.time_seconds[index])
         self.v_line.setPos(nearest_x)
 
         preview_parts = [f"t={nearest_x:.4f}s"]
@@ -389,18 +471,24 @@ class Plot2DPanel(BasePlotPanel):
         if y_value is not None:
             self.h_line.setPos(y_value)
 
-        overlay_lines = [f"t={nearest_x:.4f}s"]
-        for signal_id in self.selected_signal_ids[:6]:
+        overlay_rows: list[tuple[str, float, str]] = []
+        for order, signal_id in enumerate(self.selected_signal_ids[:6]):
             value = float(self.parsed_log.get_series(signal_id)[index])
             signal = self.signal_lookup[signal_id]
-            overlay_lines.append(f"{signal.name}={value:.6f}")
+            color = self._series_color(order)
+            overlay_rows.append((self._display_signal_label(signal), value, color))
 
-        self._set_overlay_text("\n".join(overlay_lines))
+        self._set_overlay_text(self._format_overlay_rows(overlay_rows))
+        self.v_line.show()
+        self.h_line.show()
+        self.plot_widget.viewport().update()
         self.emit_status(" | ".join(preview_parts))
 
     def _update_xy_cursor(self, x_value: float, y_value: float) -> None:
         if len(self.selected_signal_ids) != 2:
+            self._hide_cursor()
             return
+
         assert self.parsed_log is not None
         x_series = self.parsed_log.get_series(self.selected_signal_ids[0])
         y_series = self.parsed_log.get_series(self.selected_signal_ids[1])
@@ -408,18 +496,34 @@ class Plot2DPanel(BasePlotPanel):
         y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
         distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
         index = int(np.argmin(distances))
+        self._show_xy_cursor_at_index(index)
+        if self._cursor_sync_callback is not None:
+            self._cursor_sync_callback(index)
+
+    def _show_xy_cursor_at_index(self, index: int) -> None:
+        assert self.parsed_log is not None
+        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])
+        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])
         nearest_x = float(x_series[index])
         nearest_y = float(y_series[index])
+
         self.v_line.setPos(nearest_x)
         self.h_line.setPos(nearest_y)
+
         x_signal = self.signal_lookup[self.selected_signal_ids[0]]
         y_signal = self.signal_lookup[self.selected_signal_ids[1]]
         self._set_overlay_text(
-            f"点序号={index}\nX={x_signal.name}: {nearest_x:.6f}\nY={y_signal.name}: {nearest_y:.6f}"
+            self._format_overlay_rows(
+                [
+                    (f"X - {self._display_signal_label(x_signal)}", nearest_x, self._series_color(0)),
+                    (f"Y - {self._display_signal_label(y_signal)}", nearest_y, self._series_color(1)),
+                ]
+            )
         )
-        self.emit_status(
-            f"点序号={index} | {x_signal.name}={nearest_x:.6f} | {y_signal.name}={nearest_y:.6f}"
-        )
+        self.v_line.show()
+        self.h_line.show()
+        self.plot_widget.viewport().update()
+        self.emit_status(f"Point {index} | {x_signal.name}={nearest_x:.6f} | {y_signal.name}={nearest_y:.6f}")
 
 
 class Plot3DPanel(BasePlotPanel):
@@ -451,8 +555,8 @@ class Plot3DPanel(BasePlotPanel):
             self.gl_widget = None
             self.axis_item = None
             missing_label = QLabel(
-                "当前环境缺少 3D 依赖，无法显示 XYZ 图。\n"
-                f"请安装 PyOpenGL 后重启程序。\n错误信息: {GL_IMPORT_ERROR}"
+                "3D dependencies are missing, so the XYZ plot is unavailable.\n"
+                f"Install PyOpenGL and restart the app.\nError: {GL_IMPORT_ERROR}"
             )
             missing_label.setWordWrap(True)
             missing_label.setStyleSheet("color: #b54708;")
@@ -465,10 +569,10 @@ class Plot3DPanel(BasePlotPanel):
     def update_plot(self, parsed_log: ParsedLog | None, signal_lookup: dict[str, SignalNode]) -> None:
         self.parsed_log = parsed_log
         self.signal_lookup = signal_lookup
-        self.detail_label.setText("三维轨迹")
+        self.detail_label.setText("3D trajectory")
 
         if not GL_AVAILABLE or self.gl_widget is None:
-            self.message_label.setText("XYZ 图不可用，请先安装 PyOpenGL。")
+            self.message_label.setText("XYZ plot unavailable. Install PyOpenGL first.")
             return
 
         if self.line_item is not None:
@@ -476,11 +580,11 @@ class Plot3DPanel(BasePlotPanel):
             self.line_item = None
 
         if parsed_log is None:
-            self.message_label.setText("未加载数据")
+            self.message_label.setText("No data loaded")
             return
 
         if len(self.selected_signal_ids) != 3:
-            self.message_label.setText("请为当前 XYZ 图勾选 3 个信号，顺序为 X、Y、Z。")
+            self.message_label.setText("Select exactly 3 signals for the XYZ plot in X, Y, Z order.")
             return
 
         x_signal_id, y_signal_id, z_signal_id = self.selected_signal_ids
@@ -520,9 +624,9 @@ class Plot3DPanel(BasePlotPanel):
         self.gl_widget.opts["center"] = QVector3D(0.0, 0.0, 0.0)
         self.gl_widget.setCameraPosition(distance=distance)
         self._default_distance = distance
-        self.message_label.setText(f"XYZ 图: X={x_signal.name} | Y={y_signal.name} | Z={z_signal.name}")
+        self.message_label.setText(f"XYZ plot: X={x_signal.name} | Y={y_signal.name} | Z={z_signal.name}")
         self.emit_status(
-            f"XYZ 轨迹: X={x_signal.full_path} | Y={y_signal.full_path} | Z={z_signal.full_path}"
+            f"XYZ trajectory: X={x_signal.full_path} | Y={y_signal.full_path} | Z={z_signal.full_path}"
         )
 
     def reset_view(self) -> None:
