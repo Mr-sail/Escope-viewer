@@ -15,8 +15,22 @@
 
 ## 安装
 
+下面命令都需要先进入项目目录：
+
+```bash
+cd Escope-viewer
+```
+
+完整桌面版依赖：
+
 ```bash
 python3 -m pip install -r requirements.txt
+```
+
+仅运行解析层测试：
+
+```bash
+python3 -m pip install -r requirements-parser.txt
 ```
 
 Windows 下使用：
@@ -27,6 +41,12 @@ py -m pip install -r requirements.txt
 
 ## 运行
 
+先进入项目目录：
+
+```bash
+cd Escope-viewer
+```
+
 不带文件启动：
 
 ```bash
@@ -36,13 +56,14 @@ python3 -m app
 直接打开文件：
 
 ```bash
-python3 -m app data_1min_4ms_20260228132326.txt
+python3 -m app path/to/log.txt
 ```
 
 Windows 下使用：
 
 ```powershell
-py -m app .\data_1min_4ms_20260228132326.txt
+cd .\Escope-viewer
+py -m app .\path\to\log.txt
 ```
 
 ## 数据格式
@@ -60,8 +81,11 @@ py -m app .\data_1min_4ms_20260228132326.txt
 解析层测试：
 
 ```bash
+cd Escope-viewer
 python3 -m unittest discover -s tests
 ```
+
+测试样例已内置在 `tests/fixtures/sample_log.txt`，不再依赖仓库外部的大日志文件。
 
 GUI 依赖未安装时，解析层测试仍可单独运行；桌面界面需要先安装 `PySide6` 和 `pyqtgraph`。
 

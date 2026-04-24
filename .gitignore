@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .codex
 *.txt
+!requirements.txt
+!requirements-parser.txt
+!tests/fixtures/*.txt
