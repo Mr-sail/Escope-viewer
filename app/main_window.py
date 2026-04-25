@@ -8,6 +8,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -100,6 +101,20 @@ class MainWindow(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索字段，例如 J1 / Tcp / ErrCode")
 
+        range_layout = QHBoxLayout()
+        self.time_start_input = QDoubleSpinBox()
+        self.time_end_input = QDoubleSpinBox()
+        for spin_box in (self.time_start_input, self.time_end_input):
+            spin_box.setDecimals(3)
+            spin_box.setRange(0.0, 0.0)
+            spin_box.setSingleStep(0.100)
+            spin_box.setSuffix(" s")
+            spin_box.setEnabled(False)
+        self.apply_time_range_button = QPushButton("应用时间区间")
+        self.clear_time_range_button = QPushButton("全部时间")
+        self.apply_time_range_button.setEnabled(False)
+        self.clear_time_range_button.setEnabled(False)
+
         controls_layout.addWidget(self.open_button)
         controls_layout.addWidget(self.clear_button)
         controls_layout.addWidget(self.reset_button)
@@ -108,6 +123,15 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.add_xyz_button)
         controls_layout.addWidget(self.remove_panel_button)
         controls_layout.addWidget(self.search_input, 1)
+
+        range_layout.addWidget(QLabel("时间区间:"))
+        range_layout.addWidget(QLabel("Start"))
+        range_layout.addWidget(self.time_start_input)
+        range_layout.addWidget(QLabel("End"))
+        range_layout.addWidget(self.time_end_input)
+        range_layout.addWidget(self.apply_time_range_button)
+        range_layout.addWidget(self.clear_time_range_button)
+        range_layout.addStretch(1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -131,6 +155,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([360, 1220])
 
         root_layout.addLayout(controls_layout)
+        root_layout.addLayout(range_layout)
         root_layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
@@ -146,6 +171,8 @@ class MainWindow(QMainWindow):
         self.add_xy_button.clicked.connect(lambda: self.add_panel("xy"))
         self.add_xyz_button.clicked.connect(lambda: self.add_panel("xyz"))
         self.remove_panel_button.clicked.connect(self.remove_active_panel)
+        self.apply_time_range_button.clicked.connect(self.apply_time_range)
+        self.clear_time_range_button.clicked.connect(self.clear_time_range)
         self.search_input.textChanged.connect(self.apply_filter)
 
     def open_file_dialog(self) -> None:
@@ -171,13 +198,16 @@ class MainWindow(QMainWindow):
         self.parsed_log = parsed
         self.signal_lookup = {signal.signal_id: signal for signal in parsed.signals}
         self._populate_tree(parsed.signals)
+        max_time_seconds = float(parsed.time_seconds[-1])
         for panel in self.panels:
             panel.selected_signal_ids = [
                 signal_id for signal_id in panel.selected_signal_ids if signal_id in self.signal_lookup
             ]
+            panel.clamp_time_range(max_time_seconds)
             panel.update_plot(self.parsed_log, self.signal_lookup)
         if self.active_panel is not None:
             self._sync_tree_from_active_panel()
+            self._sync_time_controls_from_active_panel()
 
         self.info_label.setText(
             "文件: "
@@ -308,6 +338,7 @@ class MainWindow(QMainWindow):
             self.mdi_area.setActiveSubWindow(subwindow)
 
         self._sync_tree_from_active_panel()
+        self._sync_time_controls_from_active_panel()
         self.active_panel.set_zoom_mode("auto")
         self.cursor_label.setText("当前图已切换，可在左侧为该图重新选择信号")
 
@@ -389,6 +420,62 @@ class MainWindow(QMainWindow):
         if self.parsed_log is None or self.active_panel is None:
             return
         self.active_panel.reset_view()
+
+    def apply_time_range(self) -> None:
+        if self.parsed_log is None or self.active_panel is None:
+            return
+
+        start_seconds = float(self.time_start_input.value())
+        end_seconds = float(self.time_end_input.value())
+        if start_seconds >= end_seconds:
+            QMessageBox.warning(self, "时间区间无效", "Start 必须小于 End。")
+            return
+
+        self.active_panel.set_time_range(start_seconds, end_seconds)
+        self.active_panel.update_plot(self.parsed_log, self.signal_lookup)
+        self.active_panel.reset_view()
+        self.cursor_label.setText(f"已应用时间区间: {start_seconds:.3f}s - {end_seconds:.3f}s")
+
+    def clear_time_range(self) -> None:
+        if self.parsed_log is None or self.active_panel is None:
+            return
+
+        self.active_panel.clear_time_range()
+        self._sync_time_controls_from_active_panel()
+        self.active_panel.update_plot(self.parsed_log, self.signal_lookup)
+        self.active_panel.reset_view()
+        self.cursor_label.setText("已恢复全部时间样本")
+
+    def _sync_time_controls_from_active_panel(self) -> None:
+        controls = (
+            self.time_start_input,
+            self.time_end_input,
+            self.apply_time_range_button,
+            self.clear_time_range_button,
+        )
+        if self.parsed_log is None or self.active_panel is None:
+            for control in controls:
+                control.setEnabled(False)
+            self.time_start_input.setRange(0.0, 0.0)
+            self.time_end_input.setRange(0.0, 0.0)
+            self.time_start_input.setValue(0.0)
+            self.time_end_input.setValue(0.0)
+            return
+
+        max_seconds = float(self.parsed_log.time_seconds[-1])
+        for spin_box in (self.time_start_input, self.time_end_input):
+            spin_box.setEnabled(True)
+            spin_box.setRange(0.0, max_seconds)
+        self.apply_time_range_button.setEnabled(True)
+        self.clear_time_range_button.setEnabled(True)
+
+        if self.active_panel.time_range is None:
+            start_seconds, end_seconds = 0.0, max_seconds
+        else:
+            start_seconds, end_seconds = self.active_panel.time_range
+
+        self.time_start_input.setValue(start_seconds)
+        self.time_end_input.setValue(end_seconds)
 
     def apply_filter(self, text: str) -> None:
         query = text.strip().lower()

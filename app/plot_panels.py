@@ -85,6 +85,7 @@ class BasePlotPanel(QFrame):
         super().__init__()
         self.mode = mode
         self.selected_signal_ids: list[str] = []
+        self.time_range: tuple[float, float] | None = None
         self._activate_callback = activate_callback
         self._remove_callback = remove_callback
         self._status_callback: Callable[[str], None] | None = None
@@ -179,6 +180,30 @@ class BasePlotPanel(QFrame):
     def set_zoom_mode(self, mode: str) -> None:
         del mode
 
+    def set_time_range(self, start_seconds: float, end_seconds: float) -> None:
+        self.time_range = (start_seconds, end_seconds)
+
+    def clear_time_range(self) -> None:
+        self.time_range = None
+
+    def clamp_time_range(self, max_seconds: float) -> None:
+        if self.time_range is None:
+            return
+
+        start_seconds, end_seconds = self.time_range
+        start_seconds = max(0.0, min(start_seconds, max_seconds))
+        end_seconds = max(0.0, min(end_seconds, max_seconds))
+        self.time_range = (start_seconds, end_seconds) if start_seconds < end_seconds else None
+
+    def _time_indices(self, parsed_log: ParsedLog) -> np.ndarray:
+        sample_count = parsed_log.time_seconds.shape[0]
+        if self.time_range is None:
+            return np.arange(sample_count, dtype=int)
+
+        start_seconds, end_seconds = self.time_range
+        mask = (parsed_log.time_seconds >= start_seconds) & (parsed_log.time_seconds <= end_seconds)
+        return np.flatnonzero(mask)
+
     def update_plot(self, parsed_log: ParsedLog | None, signal_lookup: dict[str, SignalNode]) -> None:
         del parsed_log, signal_lookup
 
@@ -199,6 +224,7 @@ class Plot2DPanel(BasePlotPanel):
         self.signal_lookup: dict[str, SignalNode] = {}
         self._default_ranges: tuple[tuple[float, float], tuple[float, float]] | None = None
         self._cursor_sync_callback: Callable[[int | None], None] | None = None
+        self._visible_indices: np.ndarray = np.array([], dtype=int)
 
         self.plot_widget = AxisZoomPlotWidget(background="w")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
@@ -367,8 +393,10 @@ class Plot2DPanel(BasePlotPanel):
         if parsed_log is None:
             self.message_label.setText("No data loaded")
             self._set_overlay_text("No data loaded")
+            self._visible_indices = np.array([], dtype=int)
             return
 
+        self._visible_indices = self._time_indices(parsed_log)
         if self.mode == "xt":
             self._update_xt_plot(parsed_log, signal_lookup)
         else:
@@ -383,14 +411,21 @@ class Plot2DPanel(BasePlotPanel):
             self._set_overlay_text("X-T plot is waiting for signal selection")
             return
 
+        indices = self._visible_indices
+        if indices.size == 0:
+            self.message_label.setText("No samples in the selected time range.")
+            self._set_overlay_text("Time range contains no samples")
+            return
+
+        time_values = parsed_log.time_seconds[indices]
         all_series: list[np.ndarray] = []
         for order, signal_id in enumerate(self.selected_signal_ids):
             if signal_id not in parsed_log.signals_by_id:
                 continue
             signal = signal_lookup[signal_id]
-            series = parsed_log.get_series(signal_id)
+            series = parsed_log.get_series(signal_id)[indices]
             curve = self.plot_widget.plot(
-                parsed_log.time_seconds,
+                time_values,
                 series,
                 pen=pg.mkPen(self._series_color(order), width=2),
                 name=self._display_signal_label(signal),
@@ -401,9 +436,10 @@ class Plot2DPanel(BasePlotPanel):
         self.message_label.setText(f"X-T plot with {len(self.curves)} signal(s)")
         if all_series:
             combined = np.concatenate(all_series)
-            self._set_default_ranges(parsed_log.time_seconds, combined)
+            self._set_default_ranges(time_values, combined)
             first_signal = signal_lookup[self.selected_signal_ids[0]]
-            first_value = float(parsed_log.get_series(self.selected_signal_ids[0])[0])
+            first_index = int(indices[0])
+            first_value = float(parsed_log.get_series(self.selected_signal_ids[0])[first_index])
             self._set_overlay_text(
                 self._format_overlay_rows(
                     [(self._display_signal_label(first_signal), first_value, self._series_color(0))]
@@ -418,11 +454,17 @@ class Plot2DPanel(BasePlotPanel):
             self._set_overlay_text("X-Y plot is waiting for 2 selected signals")
             return
 
+        indices = self._visible_indices
+        if indices.size == 0:
+            self.message_label.setText("No samples in the selected time range.")
+            self._set_overlay_text("Time range contains no samples")
+            return
+
         x_signal_id, y_signal_id = self.selected_signal_ids
         x_signal = signal_lookup[x_signal_id]
         y_signal = signal_lookup[y_signal_id]
-        x_series = parsed_log.get_series(x_signal_id)
-        y_series = parsed_log.get_series(y_signal_id)
+        x_series = parsed_log.get_series(x_signal_id)[indices]
+        y_series = parsed_log.get_series(y_signal_id)[indices]
 
         x_label = self._display_signal_label(x_signal)
         y_label = self._display_signal_label(y_signal)
@@ -460,6 +502,14 @@ class Plot2DPanel(BasePlotPanel):
             return
 
         clamped_index = max(0, min(index, sample_count - 1))
+        if self.time_range is not None and (
+            self._visible_indices.size == 0
+            or clamped_index < int(self._visible_indices[0])
+            or clamped_index > int(self._visible_indices[-1])
+        ):
+            self._hide_cursor()
+            return
+
         if self.mode == "xt":
             self._show_xt_cursor_at_index(clamped_index)
         else:
@@ -486,12 +536,17 @@ class Plot2DPanel(BasePlotPanel):
 
     def _update_xt_cursor(self, x_value: float) -> None:
         assert self.parsed_log is not None
-        times = self.parsed_log.time_seconds
-        index = int(np.searchsorted(times, x_value))
-        if index >= len(times):
-            index = len(times) - 1
-        elif index > 0 and abs(times[index - 1] - x_value) <= abs(times[index] - x_value):
-            index -= 1
+        if self._visible_indices.size == 0:
+            self._hide_cursor(broadcast=True)
+            return
+
+        times = self.parsed_log.time_seconds[self._visible_indices]
+        local_index = int(np.searchsorted(times, x_value))
+        if local_index >= len(times):
+            local_index = len(times) - 1
+        elif local_index > 0 and abs(times[local_index - 1] - x_value) <= abs(times[local_index] - x_value):
+            local_index -= 1
+        index = int(self._visible_indices[local_index])
         self._show_xt_cursor_at_index(index)
         if self._cursor_sync_callback is not None:
             self._cursor_sync_callback(index)
@@ -532,12 +587,16 @@ class Plot2DPanel(BasePlotPanel):
             return
 
         assert self.parsed_log is not None
-        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])
-        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])
+        if self._visible_indices.size == 0:
+            self._hide_cursor(broadcast=True)
+            return
+
+        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])[self._visible_indices]
+        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])[self._visible_indices]
         x_span = max(float(np.max(x_series) - np.min(x_series)), 1e-9)
         y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
         distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
-        index = int(np.argmin(distances))
+        index = int(self._visible_indices[int(np.argmin(distances))])
         self._show_xy_cursor_at_index(index)
         if self._cursor_sync_callback is not None:
             self._cursor_sync_callback(index)
@@ -629,15 +688,20 @@ class Plot3DPanel(BasePlotPanel):
             self.message_label.setText("Select exactly 3 signals for the XYZ plot in X, Y, Z order.")
             return
 
+        indices = self._time_indices(parsed_log)
+        if indices.size == 0:
+            self.message_label.setText("No samples in the selected time range.")
+            return
+
         x_signal_id, y_signal_id, z_signal_id = self.selected_signal_ids
         x_signal = signal_lookup[x_signal_id]
         y_signal = signal_lookup[y_signal_id]
         z_signal = signal_lookup[z_signal_id]
         points = np.column_stack(
             [
-                parsed_log.get_series(x_signal_id),
-                parsed_log.get_series(y_signal_id),
-                parsed_log.get_series(z_signal_id),
+                parsed_log.get_series(x_signal_id)[indices],
+                parsed_log.get_series(y_signal_id)[indices],
+                parsed_log.get_series(z_signal_id)[indices],
             ]
         ).astype(np.float32)
         center = points.mean(axis=0)
