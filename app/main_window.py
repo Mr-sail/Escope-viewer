@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QHBoxLayout,
@@ -96,13 +97,8 @@ class MainWindow(QMainWindow):
         self.add_xy_button = QPushButton("新增 X-Y 图")
         self.add_xyz_button = QPushButton("新增 XYZ 图")
         self.remove_panel_button = QPushButton("关闭当前图")
-        self.zoom_x_button = QPushButton("滚轮缩放 X")
-        self.zoom_y_button = QPushButton("滚轮缩放 Y")
-        self.zoom_xy_button = QPushButton("滚轮缩放 XY")
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索字段，例如 J1 / Tcp / ErrCode")
-        for button in (self.zoom_x_button, self.zoom_y_button, self.zoom_xy_button):
-            button.setCheckable(True)
 
         controls_layout.addWidget(self.open_button)
         controls_layout.addWidget(self.clear_button)
@@ -111,9 +107,6 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.add_xy_button)
         controls_layout.addWidget(self.add_xyz_button)
         controls_layout.addWidget(self.remove_panel_button)
-        controls_layout.addWidget(self.zoom_x_button)
-        controls_layout.addWidget(self.zoom_y_button)
-        controls_layout.addWidget(self.zoom_xy_button)
         controls_layout.addWidget(self.search_input, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -122,6 +115,8 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderLabel("信号字段")
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tree.setAllColumnsShowFocus(False)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
 
         self.mdi_area = QMdiArea()
@@ -151,11 +146,7 @@ class MainWindow(QMainWindow):
         self.add_xy_button.clicked.connect(lambda: self.add_panel("xy"))
         self.add_xyz_button.clicked.connect(lambda: self.add_panel("xyz"))
         self.remove_panel_button.clicked.connect(self.remove_active_panel)
-        self.zoom_x_button.clicked.connect(lambda: self.set_zoom_mode("x"))
-        self.zoom_y_button.clicked.connect(lambda: self.set_zoom_mode("y"))
-        self.zoom_xy_button.clicked.connect(lambda: self.set_zoom_mode("xy"))
         self.search_input.textChanged.connect(self.apply_filter)
-        self.set_zoom_mode("xy")
 
     def open_file_dialog(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -231,7 +222,7 @@ class MainWindow(QMainWindow):
 
                 if depth == len(signal.path_parts) - 1:
                     item.setData(0, Qt.ItemDataRole.UserRole, signal.signal_id)
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(0, Qt.CheckState.Unchecked)
                     item.setToolTip(0, signal.full_path)
                     self.signal_item_map[signal.signal_id] = item
@@ -317,7 +308,7 @@ class MainWindow(QMainWindow):
             self.mdi_area.setActiveSubWindow(subwindow)
 
         self._sync_tree_from_active_panel()
-        self.set_zoom_mode(self._current_zoom_mode())
+        self.active_panel.set_zoom_mode("auto")
         self.cursor_label.setText("当前图已切换，可在左侧为该图重新选择信号")
 
     def _on_subwindow_activated(self, subwindow: QMdiSubWindow | None) -> None:
@@ -398,20 +389,6 @@ class MainWindow(QMainWindow):
         if self.parsed_log is None or self.active_panel is None:
             return
         self.active_panel.reset_view()
-
-    def set_zoom_mode(self, mode: str) -> None:
-        self.zoom_x_button.setChecked(mode == "x")
-        self.zoom_y_button.setChecked(mode == "y")
-        self.zoom_xy_button.setChecked(mode == "xy")
-        if self.active_panel is not None:
-            self.active_panel.set_zoom_mode(mode)
-
-    def _current_zoom_mode(self) -> str:
-        if self.zoom_x_button.isChecked():
-            return "x"
-        if self.zoom_y_button.isChecked():
-            return "y"
-        return "xy"
 
     def apply_filter(self, text: str) -> None:
         query = text.strip().lower()

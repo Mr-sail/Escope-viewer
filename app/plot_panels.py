@@ -32,24 +32,45 @@ except Exception as exc:  # pragma: no cover - depends on optional local depende
 class AxisZoomPlotWidget(pg.PlotWidget):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._zoom_mode = "xy"
+        self._zoom_mode = "auto"
+        self._default_zoom_mode = "xy"
 
     def set_zoom_mode(self, mode: str) -> None:
         self._zoom_mode = mode
 
-    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if self._zoom_mode not in {"x", "y", "xy"}:
-            return super().wheelEvent(event)
+    def set_default_zoom_mode(self, mode: str) -> None:
+        self._default_zoom_mode = mode
 
+    def _effective_zoom_mode(self, scene_pos) -> str:
+        if self._zoom_mode in {"x", "y", "xy"}:
+            return self._zoom_mode
+
+        plot_item = self.getPlotItem()
+        view_box = plot_item.vb
+        if view_box.sceneBoundingRect().contains(scene_pos):
+            return self._default_zoom_mode
+
+        left_axis = plot_item.getAxis("left")
+        bottom_axis = plot_item.getAxis("bottom")
+        if left_axis.sceneBoundingRect().contains(scene_pos):
+            return "y"
+        if bottom_axis.sceneBoundingRect().contains(scene_pos):
+            return "x"
+        return self._default_zoom_mode
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt naming
         delta = event.angleDelta().y()
         if delta == 0:
             return super().wheelEvent(event)
 
         scene_pos = self.mapToScene(event.position().toPoint())
+        zoom_mode = self._effective_zoom_mode(scene_pos)
+        if zoom_mode not in {"x", "y", "xy"}:
+            return super().wheelEvent(event)
         mouse_point = self.getPlotItem().vb.mapSceneToView(scene_pos)
         factor = 0.85 if delta > 0 else 1.0 / 0.85
-        x_factor = factor if self._zoom_mode in {"x", "xy"} else 1.0
-        y_factor = factor if self._zoom_mode in {"y", "xy"} else 1.0
+        x_factor = factor if zoom_mode in {"x", "xy"} else 1.0
+        y_factor = factor if zoom_mode in {"y", "xy"} else 1.0
         self.getPlotItem().vb.scaleBy(x=x_factor, y=y_factor, center=mouse_point)
         event.accept()
 
@@ -85,6 +106,7 @@ class BasePlotPanel(QFrame):
         layout.setSpacing(8)
 
         header_layout = QHBoxLayout()
+        self.header_layout = header_layout
         self.title_label = QLabel()
         self.title_label.setStyleSheet("font-weight: 700; font-size: 14px;")
         self.detail_label = QLabel()
@@ -184,6 +206,7 @@ class Plot2DPanel(BasePlotPanel):
         self.plot_widget.getPlotItem().setDownsampling(mode="peak")
         self.plot_widget.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.plot_widget.setMouseEnabled(x=True, y=True)
+        self.plot_widget.set_default_zoom_mode("xy")
 
         self.legend = None
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#555555", width=1))
@@ -217,6 +240,14 @@ class Plot2DPanel(BasePlotPanel):
         self.value_overlay.raise_()
         self.value_overlay.show()
 
+        self.equal_scale_button: QPushButton | None = None
+        if self.mode == "xy":
+            self.equal_scale_button = QPushButton("1:1")
+            self.equal_scale_button.setCheckable(True)
+            self.equal_scale_button.setToolTip("Keep X and Y using the same display scale")
+            self.equal_scale_button.toggled.connect(self._on_equal_scale_toggled)
+            self.header_layout.insertWidget(2, self.equal_scale_button)
+
         self.plot_widget.installEventFilter(self)
         self.plot_widget.viewport().installEventFilter(self)
 
@@ -226,7 +257,7 @@ class Plot2DPanel(BasePlotPanel):
             slot=self._on_mouse_moved,
         )
 
-        self.set_zoom_mode("xy")
+        self.set_zoom_mode("auto")
 
     @property
     def selection_limit(self) -> int | None:
@@ -236,10 +267,21 @@ class Plot2DPanel(BasePlotPanel):
 
     def set_zoom_mode(self, mode: str) -> None:
         self.plot_widget.set_zoom_mode(mode)
-        self.detail_label.setText(f"Zoom wheel: {mode.upper()}")
+        if mode == "auto":
+            default_mode = "X-T" if self.mode == "xt" else "X-Y"
+            self.detail_label.setText(f"Wheel: Auto | Hover axis to zoom X/Y | Plot area={default_mode}")
+            return
+        self.detail_label.setText(f"Wheel locked: {mode.upper()}")
 
     def set_cursor_sync_callback(self, callback: Callable[[int | None], None]) -> None:
         self._cursor_sync_callback = callback
+
+    def _on_equal_scale_toggled(self, checked: bool) -> None:
+        if self.mode != "xy":
+            return
+        self.plot_widget.getViewBox().setAspectLocked(lock=checked, ratio=1.0)
+        if self._default_ranges is not None:
+            self._apply_default_ranges()
 
     @staticmethod
     def _display_signal_label(signal: SignalNode) -> str:
