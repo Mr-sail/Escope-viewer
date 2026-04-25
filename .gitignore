@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 .venv/
 .codex
+build/
+dist/
+*.spec
 *.txt
 !requirements.txt
 !requirements-parser.txt
