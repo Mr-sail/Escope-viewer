@@ -225,8 +225,13 @@ class Plot2DPanel(BasePlotPanel):
         self._default_ranges: tuple[tuple[float, float], tuple[float, float]] | None = None
         self._cursor_sync_callback: Callable[[int | None], None] | None = None
         self._visible_indices: np.ndarray = np.array([], dtype=int)
+        self._measurement_indices: list[int] = []
+        self._measurement_status: str | None = None
+        self._current_cursor_index: int | None = None
 
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.plot_widget = AxisZoomPlotWidget(background="w")
+        self.plot_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
         self.plot_widget.getPlotItem().setClipToView(True)
         self.plot_widget.getPlotItem().setDownsampling(mode="peak")
@@ -282,6 +287,7 @@ class Plot2DPanel(BasePlotPanel):
             rateLimit=60,
             slot=self._on_mouse_moved,
         )
+        self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
 
         self.set_zoom_mode("auto")
 
@@ -336,7 +342,13 @@ class Plot2DPanel(BasePlotPanel):
         if self.legend is not None:
             self.legend.clear()
         self._default_ranges = None
+        self._current_cursor_index = None
+        self._clear_measurement()
         self._hide_cursor()
+
+    def _clear_measurement(self) -> None:
+        self._measurement_indices.clear()
+        self._measurement_status = None
 
     def _set_overlay_text(self, text: str) -> None:
         self.value_overlay.setText(text)
@@ -359,6 +371,11 @@ class Plot2DPanel(BasePlotPanel):
     def eventFilter(self, watched, event) -> bool:
         if watched is self.plot_widget and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
             self._reposition_overlay()
+        elif watched is self.plot_widget and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Left and self._step_cursor(-1):
+                return True
+            if event.key() == Qt.Key.Key_Right and self._step_cursor(1):
+                return True
         elif watched is self.plot_widget.viewport() and event.type() in {QEvent.Type.Leave, QEvent.Type.Hide}:
             self._hide_cursor(broadcast=True)
         return super().eventFilter(watched, event)
@@ -493,6 +510,7 @@ class Plot2DPanel(BasePlotPanel):
 
     def sync_cursor_to_index(self, index: int | None) -> None:
         if index is None or self.parsed_log is None or not self.curves:
+            self._current_cursor_index = None
             self._hide_cursor()
             return
 
@@ -507,9 +525,11 @@ class Plot2DPanel(BasePlotPanel):
             or clamped_index < int(self._visible_indices[0])
             or clamped_index > int(self._visible_indices[-1])
         ):
+            self._current_cursor_index = None
             self._hide_cursor()
             return
 
+        self._current_cursor_index = clamped_index
         if self.mode == "xt":
             self._show_xt_cursor_at_index(clamped_index)
         else:
@@ -563,6 +583,107 @@ class Plot2DPanel(BasePlotPanel):
         else:
             self._update_xy_cursor(mouse_point.x(), mouse_point.y())
 
+    def _on_mouse_clicked(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.plot_widget.setFocus(Qt.FocusReason.MouseFocusReason)
+        if self.parsed_log is None or not self.curves:
+            return
+
+        scene_pos = event.scenePos()
+        view_rect = self.plot_widget.getPlotItem().vb.sceneBoundingRect()
+        if not view_rect.contains(scene_pos):
+            return
+
+        mouse_point = self.plot_widget.getPlotItem().vb.mapSceneToView(scene_pos)
+        index = self._nearest_sample_index(mouse_point.x(), mouse_point.y())
+        if index is None:
+            return
+
+        self._current_cursor_index = index
+        if len(self._measurement_indices) >= 2:
+            self._measurement_indices.clear()
+
+        self._measurement_indices.append(index)
+        if len(self._measurement_indices) == 1:
+            time_seconds = float(self.parsed_log.time_seconds[index])
+            self._measurement_status = f"已选择第1点: t={time_seconds:.6f}s；再点击第2点计算时间差"
+            self.emit_status(self._measurement_status)
+            return
+
+        first_index, second_index = self._measurement_indices
+        first_time = float(self.parsed_log.time_seconds[first_index])
+        second_time = float(self.parsed_log.time_seconds[second_index])
+        delta_ms = abs(second_time - first_time) * 1000.0
+        rounded_delta_ms = int(round(delta_ms))
+        cycle_count = int(round(delta_ms / 4.0))
+        self._measurement_status = (
+            f"两点时间差: {rounded_delta_ms} ms | {cycle_count} 个周期(4ms/周期) | "
+            f"点1 t={first_time:.6f}s, 点2 t={second_time:.6f}s"
+        )
+        self.emit_status(self._measurement_status)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key.Key_Left:
+            if self._step_cursor(-1):
+                event.accept()
+                return
+        elif event.key() == Qt.Key.Key_Right:
+            if self._step_cursor(1):
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+    def _step_cursor(self, direction: int) -> bool:
+        if self.parsed_log is None or not self.curves or self._visible_indices.size == 0:
+            return False
+
+        if self._current_cursor_index is None:
+            current_position = 0 if direction >= 0 else self._visible_indices.size - 1
+        else:
+            current_position = int(np.searchsorted(self._visible_indices, self._current_cursor_index))
+            if current_position >= self._visible_indices.size:
+                current_position = self._visible_indices.size - 1
+            elif self._visible_indices[current_position] != self._current_cursor_index and direction < 0:
+                current_position -= 1
+            current_position = max(0, min(current_position + direction, self._visible_indices.size - 1))
+
+        index = int(self._visible_indices[current_position])
+        self._current_cursor_index = index
+        self._clear_measurement()
+        if self.mode == "xt":
+            self._show_xt_cursor_at_index(index)
+        else:
+            self._show_xy_cursor_at_index(index)
+        if self._cursor_sync_callback is not None:
+            self._cursor_sync_callback(index)
+        return True
+
+    def _nearest_sample_index(self, x_value: float, y_value: float) -> int | None:
+        if self.parsed_log is None or self._visible_indices.size == 0:
+            return None
+
+        if self.mode == "xt":
+            times = self.parsed_log.time_seconds[self._visible_indices]
+            local_index = int(np.searchsorted(times, x_value))
+            if local_index >= len(times):
+                local_index = len(times) - 1
+            elif local_index > 0 and abs(times[local_index - 1] - x_value) <= abs(times[local_index] - x_value):
+                local_index -= 1
+            return int(self._visible_indices[local_index])
+
+        if len(self.selected_signal_ids) != 2:
+            return None
+
+        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])[self._visible_indices]
+        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])[self._visible_indices]
+        x_span = max(float(np.max(x_series) - np.min(x_series)), 1e-9)
+        y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
+        distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
+        return int(self._visible_indices[int(np.argmin(distances))])
+
     def _update_xt_cursor(self, x_value: float) -> None:
         assert self.parsed_log is not None
         if self._visible_indices.size == 0:
@@ -576,6 +697,7 @@ class Plot2DPanel(BasePlotPanel):
         elif local_index > 0 and abs(times[local_index - 1] - x_value) <= abs(times[local_index] - x_value):
             local_index -= 1
         index = int(self._visible_indices[local_index])
+        self._current_cursor_index = index
         self._show_xt_cursor_at_index(index)
         if self._cursor_sync_callback is not None:
             self._cursor_sync_callback(index)
@@ -608,7 +730,7 @@ class Plot2DPanel(BasePlotPanel):
         self.v_line.show()
         self.h_line.show()
         self.plot_widget.viewport().update()
-        self.emit_status(" | ".join(preview_parts))
+        self.emit_status(self._measurement_status or " | ".join(preview_parts))
 
     def _update_xy_cursor(self, x_value: float, y_value: float) -> None:
         if len(self.selected_signal_ids) != 2:
@@ -626,6 +748,7 @@ class Plot2DPanel(BasePlotPanel):
         y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
         distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
         index = int(self._visible_indices[int(np.argmin(distances))])
+        self._current_cursor_index = index
         self._show_xy_cursor_at_index(index)
         if self._cursor_sync_callback is not None:
             self._cursor_sync_callback(index)
@@ -653,7 +776,8 @@ class Plot2DPanel(BasePlotPanel):
         self.v_line.show()
         self.h_line.show()
         self.plot_widget.viewport().update()
-        self.emit_status(f"Point {index} | {x_signal.name}={nearest_x:.6f} | {y_signal.name}={nearest_y:.6f}")
+        status = f"Point {index} | {x_signal.name}={nearest_x:.6f} | {y_signal.name}={nearest_y:.6f}"
+        self.emit_status(self._measurement_status or status)
 
 
 class Plot3DPanel(BasePlotPanel):
