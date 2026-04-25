@@ -39,3 +39,16 @@ class ParsedLog:
     def get_series(self, signal_id: str) -> np.ndarray:
         return self.signals_by_id[signal_id]
 
+
+@dataclass(frozen=True)
+class LogEvent:
+    sample_index: int
+    time_seconds: float
+    time_raw: str
+    signal_id: str
+    signal_name: str
+    signal_path: str
+    previous_value: float
+    current_value: float
+    event_type: str
+

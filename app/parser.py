@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,8 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from .models import LogFileMeta, ParsedLog, SignalNode
+
+ProgressCallback = Callable[[int, str], bool]
 
 
 class ParseError(ValueError):
@@ -130,7 +133,12 @@ def build_signal_tree(xml_section: str, id_row: str) -> list[SignalNode]:
     )
 
 
-def parse_log_file(path: str | Path) -> ParsedLog:
+def _report_progress(callback: ProgressCallback | None, percent: int, message: str) -> None:
+    if callback is not None and not callback(percent, message):
+        raise ParseError("用户取消了文件加载。")
+
+
+def parse_log_file(path: str | Path, progress_callback: ProgressCallback | None = None) -> ParsedLog:
     file_path = Path(path).expanduser().resolve()
     if not file_path.exists():
         raise ParseError(f"文件不存在: {file_path}")
@@ -147,10 +155,22 @@ def parse_log_file(path: str | Path) -> ParsedLog:
     time_seconds: list[float] = []
     rows: list[np.ndarray] = []
     start_time: datetime | None = None
+    total_bytes = max(file_path.stat().st_size, 1)
+    line_count = 0
 
+    _report_progress(progress_callback, 0, "正在读取文件...")
     with file_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
         phase = "xml"
-        for raw_line in handle:
+        while True:
+            raw_line = handle.readline()
+            if raw_line == "":
+                break
+
+            line_count += 1
+            if line_count % 256 == 0:
+                percent = min(95, int((handle.tell() / total_bytes) * 95))
+                _report_progress(progress_callback, percent, "正在解析数据...")
+
             stripped = raw_line.strip()
 
             if phase == "xml":
@@ -200,6 +220,7 @@ def parse_log_file(path: str | Path) -> ParsedLog:
             time_seconds.append((row_time - start_time).total_seconds())
             rows.append(row_values)
 
+    _report_progress(progress_callback, 96, "正在整理曲线数据...")
     if not separator_found:
         raise ParseError("文件缺少 XML 与数据区的分隔线。")
     if signal_nodes is None or column_ids is None or expected_fields is None:
@@ -219,7 +240,7 @@ def parse_log_file(path: str | Path) -> ParsedLog:
         skipped_rows=skipped_rows,
     )
 
-    return ParsedLog(
+    parsed = ParsedLog(
         meta=meta,
         time_raw=np.array(time_raw, dtype=str),
         time_seconds=np.array(time_seconds, dtype=float),
@@ -227,3 +248,5 @@ def parse_log_file(path: str | Path) -> ParsedLog:
         signals=signal_nodes,
         skipped_rows=skipped_rows,
     )
+    _report_progress(progress_callback, 98, "曲线数据已加载")
+    return parsed

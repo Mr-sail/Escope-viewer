@@ -515,6 +515,35 @@ class Plot2DPanel(BasePlotPanel):
         else:
             self._show_xy_cursor_at_index(clamped_index)
 
+    def focus_sample_index(self, index: int) -> None:
+        if self.parsed_log is None or not self.curves:
+            return
+
+        if self.time_range is not None and (
+            self._visible_indices.size == 0
+            or index < int(self._visible_indices[0])
+            or index > int(self._visible_indices[-1])
+        ):
+            self._hide_cursor()
+            return
+
+        self.sync_cursor_to_index(index)
+        if self.mode != "xt":
+            return
+
+        times = self.parsed_log.time_seconds
+        if times.shape[0] == 0:
+            return
+
+        clamped_index = max(0, min(index, times.shape[0] - 1))
+        center = float(times[clamped_index])
+        total_span = max(float(times[-1] - times[0]), 1.0)
+        window = max(total_span * 0.02, 0.5)
+        x_min = max(float(times[0]), center - window)
+        x_max = min(float(times[-1]), center + window)
+        if x_min < x_max:
+            self.plot_widget.setXRange(x_min, x_max, padding=0.0)
+
     def _on_mouse_moved(self, event: tuple[object]) -> None:
         if self.parsed_log is None or not self.curves:
             self.emit_status("No visible data in the current plot")

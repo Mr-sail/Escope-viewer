@@ -17,15 +17,20 @@ from PySide6.QtWidgets import (
     QMdiArea,
     QMdiSubWindow,
     QMessageBox,
+    QHeaderView,
     QPushButton,
+    QProgressDialog,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .models import ParsedLog, SignalNode
+from .events import detect_events
+from .models import LogEvent, ParsedLog, SignalNode
 from .parser import ParseError, parse_log_file
 from .plot_panels import BasePlotPanel, Plot2DPanel, Plot3DPanel
 
@@ -71,6 +76,7 @@ class MainWindow(QMainWindow):
         self.panels: list[BasePlotPanel] = []
         self.panel_windows: dict[BasePlotPanel, PlotSubWindow] = {}
         self.active_panel: BasePlotPanel | None = None
+        self.detected_events: list[LogEvent] = []
         self._suppress_item_changed = False
         self._initial_path = initial_path
 
@@ -154,9 +160,48 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([360, 1220])
 
+        self.event_table = QTableWidget(0, 5)
+        self.event_table.setHorizontalHeaderLabels(["时间(s)", "原始时间", "字段", "变化", "类型"])
+        self.event_table.setAlternatingRowColors(True)
+        self.event_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.event_table.setSortingEnabled(False)
+        self.event_table.verticalHeader().setVisible(False)
+        self.event_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.event_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.event_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.event_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.event_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+
+        event_bar_layout = QHBoxLayout()
+        self.toggle_events_button = QPushButton("隐藏事件")
+        self.event_summary_label = QLabel("事件: 未加载")
+        self.event_summary_label.setStyleSheet("color: #666666;")
+        event_bar_layout.addWidget(self.toggle_events_button)
+        event_bar_layout.addWidget(self.event_summary_label, 1)
+
+        event_panel = QWidget()
+        event_panel_layout = QVBoxLayout(event_panel)
+        event_panel_layout.setContentsMargins(0, 0, 0, 0)
+        event_panel_layout.setSpacing(4)
+        event_panel_layout.addLayout(event_bar_layout)
+        event_panel_layout.addWidget(self.event_table)
+        self.event_panel = event_panel
+
+        workspace_splitter = QSplitter(Qt.Orientation.Vertical)
+        workspace_splitter.addWidget(splitter)
+        workspace_splitter.addWidget(self.event_panel)
+        workspace_splitter.setStretchFactor(0, 1)
+        workspace_splitter.setStretchFactor(1, 0)
+        workspace_splitter.setSizes([720, 170])
+        self.workspace_splitter = workspace_splitter
+        self._event_panel_expanded_height = 170
+        self.event_table.hide()
+        self.toggle_events_button.setText("显示事件")
+
         root_layout.addLayout(controls_layout)
         root_layout.addLayout(range_layout)
-        root_layout.addWidget(splitter, 1)
+        root_layout.addWidget(workspace_splitter, 1)
         self.setCentralWidget(central)
 
         self.info_label = QLabel("未加载文件")
@@ -173,7 +218,10 @@ class MainWindow(QMainWindow):
         self.remove_panel_button.clicked.connect(self.remove_active_panel)
         self.apply_time_range_button.clicked.connect(self.apply_time_range)
         self.clear_time_range_button.clicked.connect(self.clear_time_range)
+        self.toggle_events_button.clicked.connect(self.toggle_event_panel)
+        self.event_table.cellDoubleClicked.connect(self._on_event_row_activated)
         self.search_input.textChanged.connect(self.apply_filter)
+        self._set_event_panel_collapsed()
 
     def open_file_dialog(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -186,18 +234,41 @@ class MainWindow(QMainWindow):
             self.load_file(Path(filename))
 
     def load_file(self, path: Path) -> None:
+        progress = QProgressDialog("正在读取文件...", "取消", 0, 100, self)
+        progress.setWindowTitle("加载日志")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def report_progress(percent: int, message: str) -> bool:
+            progress.setValue(percent)
+            progress.setLabelText(message)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            parsed = parse_log_file(path)
+            parsed = parse_log_file(path, progress_callback=report_progress)
+            if progress.wasCanceled():
+                return
+            progress.setValue(99)
+            progress.setLabelText("正在识别事件...")
+            QApplication.processEvents()
+            detected_events = detect_events(parsed)
+            progress.setValue(100)
         except ParseError as exc:
+            if progress.wasCanceled():
+                return
             QMessageBox.critical(self, "打开失败", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
+            progress.close()
 
         self.parsed_log = parsed
+        self.detected_events = detected_events
         self.signal_lookup = {signal.signal_id: signal for signal in parsed.signals}
         self._populate_tree(parsed.signals)
+        self._populate_event_table(detected_events)
         max_time_seconds = float(parsed.time_seconds[-1])
         for panel in self.panels:
             panel.selected_signal_ids = [
@@ -266,6 +337,55 @@ class MainWindow(QMainWindow):
         self._suppress_item_changed = False
         self.apply_filter(self.search_input.text())
         self._sync_tree_from_active_panel()
+
+    def _populate_event_table(self, events: list[LogEvent]) -> None:
+        self.event_table.setRowCount(0)
+        if not events:
+            self.event_table.insertRow(0)
+            self.event_table.setItem(0, 2, QTableWidgetItem("未识别到状态/报警事件字段"))
+            self.event_table.setToolTip("当前文件未识别到状态/报警事件字段")
+            self.event_summary_label.setText("事件: 0")
+            return
+
+        for row, event in enumerate(events):
+            self.event_table.insertRow(row)
+            values = [
+                f"{event.time_seconds:.3f}",
+                event.time_raw,
+                event.signal_path,
+                f"{event.previous_value:g} -> {event.current_value:g}",
+                event.event_type,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(event.signal_path)
+                item.setData(Qt.ItemDataRole.UserRole, event.sample_index)
+                self.event_table.setItem(row, column, item)
+
+        self.event_table.setToolTip(f"识别到 {len(events)} 个状态/报警事件，双击可跳转到对应采样点")
+        self.event_summary_label.setText(f"事件: {len(events)}")
+
+    def toggle_event_panel(self) -> None:
+        visible = self.event_table.isVisible()
+        sizes = self.workspace_splitter.sizes()
+        if visible and len(sizes) >= 2:
+            self._event_panel_expanded_height = max(sizes[1], self._event_panel_expanded_height)
+
+        self.event_table.setVisible(not visible)
+        self.toggle_events_button.setText("显示事件" if visible else "隐藏事件")
+        QApplication.processEvents()
+
+        if visible:
+            self._set_event_panel_collapsed()
+        else:
+            total_height = sum(self.workspace_splitter.sizes())
+            expanded_height = min(self._event_panel_expanded_height, max(total_height // 2, 1))
+            self.workspace_splitter.setSizes([max(total_height - expanded_height, 1), expanded_height])
+
+    def _set_event_panel_collapsed(self) -> None:
+        total_height = sum(self.workspace_splitter.sizes())
+        collapsed_height = self.toggle_events_button.sizeHint().height() + 10
+        self.workspace_splitter.setSizes([max(total_height - collapsed_height, 1), collapsed_height])
 
     def add_panel(self, mode: str) -> None:
         if mode == "xyz":
@@ -501,6 +621,27 @@ class MainWindow(QMainWindow):
     def _update_panel_status(self, panel: BasePlotPanel, text: str) -> None:
         if panel is self.active_panel:
             self.cursor_label.setText(text)
+
+    def _on_event_row_activated(self, row: int, column: int) -> None:
+        del column
+        item = self.event_table.item(row, 0)
+        if item is None:
+            return
+
+        sample_index = item.data(Qt.ItemDataRole.UserRole)
+        if sample_index is None:
+            return
+
+        event = self.detected_events[row] if row < len(self.detected_events) else None
+        for panel in self.panels:
+            if isinstance(panel, Plot2DPanel):
+                panel.focus_sample_index(int(sample_index))
+
+        if event is not None:
+            self.cursor_label.setText(
+                f"事件: {event.time_seconds:.3f}s | {event.signal_name} "
+                f"{event.previous_value:g} -> {event.current_value:g}"
+            )
 
     def _sync_plot_cursors(self, source_panel: Plot2DPanel, index: int | None) -> None:
         for panel in self.panels:
