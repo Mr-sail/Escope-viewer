@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 from .events import detect_events
 from .models import LogEvent, ParsedLog, SignalNode
 from .parser import ParseError, parse_log_file
-from .plot_panels import BasePlotPanel, Plot2DPanel, Plot3DPanel
+from .plot_panels import BasePlotPanel, Plot2DPanel, Plot3DPanel, RobotPosePanel
 
 
 class PlotSubWindow(QMdiSubWindow):
@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
         self._drop_targets: list[QWidget] = []
         self.active_panel: BasePlotPanel | None = None
         self.detected_events: list[LogEvent] = []
+        self.current_sample_index: int | None = None
         self._suppress_item_changed = False
         self._initial_path = initial_path
 
@@ -163,6 +164,7 @@ class MainWindow(QMainWindow):
         self.add_xy_button = QPushButton("新增 X-Y 图")
         self.add_xyz_button = QPushButton("新增 XYZ 图")
         self.remove_panel_button = QPushButton("关闭当前图")
+        self.add_robot_button = QPushButton("Robot")
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索字段，例如 J1 / Tcp / ErrCode")
 
@@ -186,6 +188,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.add_xt_button)
         controls_layout.addWidget(self.add_xy_button)
         controls_layout.addWidget(self.add_xyz_button)
+        controls_layout.addWidget(self.add_robot_button)
         controls_layout.addWidget(self.remove_panel_button)
         controls_layout.addWidget(self.search_input, 1)
 
@@ -280,6 +283,7 @@ class MainWindow(QMainWindow):
         self.add_xt_button.clicked.connect(lambda: self.add_panel("xt"))
         self.add_xy_button.clicked.connect(lambda: self.add_panel("xy"))
         self.add_xyz_button.clicked.connect(lambda: self.add_panel("xyz"))
+        self.add_robot_button.clicked.connect(lambda: self.add_panel("robot"))
         self.remove_panel_button.clicked.connect(self.remove_active_panel)
         self.apply_time_range_button.clicked.connect(self.apply_time_range)
         self.clear_time_range_button.clicked.connect(self.clear_time_range)
@@ -331,6 +335,7 @@ class MainWindow(QMainWindow):
 
         self.parsed_log = parsed
         self.detected_events = detected_events
+        self.current_sample_index = 0 if parsed.time_seconds.shape[0] else None
         self.signal_lookup = {signal.signal_id: signal for signal in parsed.signals}
         self._populate_tree(parsed.signals)
         self._populate_event_table(detected_events)
@@ -453,31 +458,51 @@ class MainWindow(QMainWindow):
         self.workspace_splitter.setSizes([max(total_height - collapsed_height, 1), collapsed_height])
 
     def add_panel(self, mode: str) -> None:
-        if mode == "xyz":
-            panel: BasePlotPanel = Plot3DPanel(self.set_active_panel, self.remove_panel)
-        else:
-            panel = Plot2DPanel(mode, self.set_active_panel, self.remove_panel)
+        freeze_updates = mode in {"xyz", "robot"}
+        if freeze_updates:
+            self.setUpdatesEnabled(False)
+            self.mdi_area.setUpdatesEnabled(False)
+            self.mdi_area.viewport().setUpdatesEnabled(False)
 
-        subwindow = PlotSubWindow(panel, self.remove_panel)
-        panel.set_status_callback(lambda text, owner=panel: self._update_panel_status(owner, text))
-        if isinstance(panel, Plot2DPanel):
-            panel.set_cursor_sync_callback(lambda index, owner=panel: self._sync_plot_cursors(owner, index))
+        try:
+            if mode == "xyz":
+                panel: BasePlotPanel = Plot3DPanel(self.set_active_panel, self.remove_panel)
+            elif mode == "robot":
+                panel = RobotPosePanel(self.set_active_panel, self.remove_panel)
+            else:
+                panel = Plot2DPanel(mode, self.set_active_panel, self.remove_panel)
 
-        self.mdi_area.addSubWindow(subwindow)
-        self.panels.append(panel)
-        self.panel_windows[panel] = subwindow
-        self._register_drop_target(subwindow)
-        self._register_drop_target(panel)
-        if isinstance(panel, Plot2DPanel):
-            self._register_drop_target(panel.plot_widget)
-            self._register_drop_target(panel.plot_widget.viewport())
-        elif isinstance(panel, Plot3DPanel):
-            self._register_drop_target(panel.gl_widget)
-        self._update_panel_titles()
-        panel.update_plot(self.parsed_log, self.signal_lookup)
-        self._position_new_panel(subwindow, mode)
-        subwindow.show()
-        self.set_active_panel(panel)
+            subwindow = PlotSubWindow(panel, self.remove_panel)
+            panel.set_status_callback(lambda text, owner=panel: self._update_panel_status(owner, text))
+            if isinstance(panel, Plot2DPanel):
+                panel.set_cursor_sync_callback(lambda index, owner=panel: self._sync_plot_cursors(owner, index))
+
+            self.mdi_area.addSubWindow(subwindow)
+            self.panels.append(panel)
+            self.panel_windows[panel] = subwindow
+            self._register_drop_target(subwindow)
+            self._register_drop_target(panel)
+            if isinstance(panel, Plot2DPanel):
+                self._register_drop_target(panel.plot_widget)
+                self._register_drop_target(panel.plot_widget.viewport())
+            elif isinstance(panel, Plot3DPanel):
+                self._register_drop_target(panel.gl_widget)
+            elif isinstance(panel, RobotPosePanel):
+                self._register_drop_target(panel.gl_widget)
+            self._update_panel_titles()
+            panel.update_plot(self.parsed_log, self.signal_lookup)
+            if self.current_sample_index is not None:
+                panel.sync_sample_index(self.current_sample_index)
+            self._position_new_panel(subwindow, mode)
+            subwindow.show()
+            self.set_active_panel(panel)
+        finally:
+            if freeze_updates:
+                self.mdi_area.viewport().setUpdatesEnabled(True)
+                self.mdi_area.setUpdatesEnabled(True)
+                self.setUpdatesEnabled(True)
+                self.mdi_area.viewport().update()
+                self.mdi_area.update()
 
     def remove_panel(self, panel: BasePlotPanel) -> None:
         if panel not in self.panels:
@@ -509,7 +534,7 @@ class MainWindow(QMainWindow):
             self.remove_panel(self.active_panel)
 
     def _update_panel_titles(self) -> None:
-        mode_names = {"xt": "X-T", "xy": "X-Y", "xyz": "XYZ"}
+        mode_names = {"xt": "X-T", "xy": "X-Y", "xyz": "XYZ", "robot": "Robot"}
         for index, panel in enumerate(self.panels, start=1):
             title = f"图 {index} - {mode_names.get(panel.mode, panel.mode.upper())}"
             panel.set_panel_title(title)
@@ -546,7 +571,7 @@ class MainWindow(QMainWindow):
         viewport_width = max(viewport_size.width(), 900)
         viewport_height = max(viewport_size.height(), 700)
         width = min(max(viewport_width - 80, 640), 1000)
-        height = 420 if mode == "xyz" else 320
+        height = 460 if mode == "robot" else 420 if mode == "xyz" else 320
         height = min(height, viewport_height - 40)
         offset = 36 * (len(self.panels) - 1)
         x = min(offset, max(viewport_width - width - 20, 0))
@@ -616,6 +641,8 @@ class MainWindow(QMainWindow):
     def apply_time_range(self) -> None:
         if self.parsed_log is None or self.active_panel is None:
             return
+        if not self.active_panel.supports_time_range:
+            return
 
         start_seconds = float(self.time_start_input.value())
         end_seconds = float(self.time_end_input.value())
@@ -631,6 +658,8 @@ class MainWindow(QMainWindow):
     def clear_time_range(self) -> None:
         if self.parsed_log is None or self.active_panel is None:
             return
+        if not self.active_panel.supports_time_range:
+            return
 
         self.active_panel.clear_time_range()
         self._sync_time_controls_from_active_panel()
@@ -645,7 +674,7 @@ class MainWindow(QMainWindow):
             self.apply_time_range_button,
             self.clear_time_range_button,
         )
-        if self.parsed_log is None or self.active_panel is None:
+        if self.parsed_log is None or self.active_panel is None or not self.active_panel.supports_time_range:
             for control in controls:
                 control.setEnabled(False)
             self.time_start_input.setRange(0.0, 0.0)
@@ -703,11 +732,11 @@ class MainWindow(QMainWindow):
         sample_index = item.data(Qt.ItemDataRole.UserRole)
         if sample_index is None:
             return
+        self.current_sample_index = int(sample_index)
 
         event = self.detected_events[row] if row < len(self.detected_events) else None
         for panel in self.panels:
-            if isinstance(panel, Plot2DPanel):
-                panel.focus_sample_index(int(sample_index))
+            panel.focus_sample_index(int(sample_index))
 
         if event is not None:
             self.cursor_label.setText(
@@ -716,11 +745,12 @@ class MainWindow(QMainWindow):
             )
 
     def _sync_plot_cursors(self, source_panel: Plot2DPanel, index: int | None) -> None:
+        if index is not None:
+            self.current_sample_index = int(index)
         for panel in self.panels:
             if panel is source_panel:
                 continue
-            if isinstance(panel, Plot2DPanel):
-                panel.sync_cursor_to_index(index)
+            panel.sync_sample_index(index)
 
 
 def launch_app(initial_path: Path | None = None) -> int:

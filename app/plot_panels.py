@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import html
+from pathlib import Path
+import re
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import (
     QFrame,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -17,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models import ParsedLog, SignalNode
+from .robot_model import RobotModel, RobotModelError, load_robot_model
 
 try:
     import pyqtgraph.opengl as gl
@@ -27,6 +31,16 @@ except Exception as exc:  # pragma: no cover - depends on optional local depende
     gl = None
     GL_AVAILABLE = False
     GL_IMPORT_ERROR = str(exc)
+
+
+ROBOT_LINK_COLOR = (0.09, 0.43, 0.86, 1.0)
+ROBOT_JOINT_COLOR = (0.98, 0.62, 0.17, 1.0)
+AXIS_X_COLOR = (0.89, 0.16, 0.16, 0.9)
+AXIS_Y_COLOR = (0.10, 0.64, 0.23, 0.9)
+AXIS_Z_COLOR = (0.13, 0.44, 0.82, 0.9)
+WORLD_AXIS_X_COLOR = (0.89, 0.16, 0.16, 0.45)
+WORLD_AXIS_Y_COLOR = (0.10, 0.64, 0.23, 0.45)
+WORLD_AXIS_Z_COLOR = (0.13, 0.44, 0.82, 0.45)
 
 
 class AxisZoomPlotWidget(pg.PlotWidget):
@@ -142,6 +156,10 @@ class BasePlotPanel(QFrame):
     def selection_limit(self) -> int | None:
         return None
 
+    @property
+    def supports_time_range(self) -> bool:
+        return True
+
     def set_status_callback(self, callback: Callable[[str], None]) -> None:
         self._status_callback = callback
 
@@ -209,6 +227,12 @@ class BasePlotPanel(QFrame):
 
     def reset_view(self) -> None:
         return
+
+    def sync_sample_index(self, index: int | None) -> None:
+        del index
+
+    def focus_sample_index(self, index: int) -> None:
+        self.sync_sample_index(index)
 
 
 class Plot2DPanel(BasePlotPanel):
@@ -508,6 +532,9 @@ class Plot2DPanel(BasePlotPanel):
     def reset_view(self) -> None:
         self._apply_default_ranges()
 
+    def sync_sample_index(self, index: int | None) -> None:
+        self.sync_cursor_to_index(index)
+
     def sync_cursor_to_index(self, index: int | None) -> None:
         if index is None or self.parsed_log is None or not self.curves:
             self._current_cursor_index = None
@@ -602,6 +629,12 @@ class Plot2DPanel(BasePlotPanel):
             return
 
         self._current_cursor_index = index
+        if self.mode == "xt":
+            self._show_xt_cursor_at_index(index)
+        else:
+            self._show_xy_cursor_at_index(index)
+        if self._cursor_sync_callback is not None:
+            self._cursor_sync_callback(index)
         if len(self._measurement_indices) >= 2:
             self._measurement_indices.clear()
 
@@ -891,6 +924,509 @@ class Plot3DPanel(BasePlotPanel):
     def reset_view(self) -> None:
         if self.gl_widget is not None:
             self.gl_widget.opts["center"] = QVector3D(0.0, 0.0, 0.0)
+            self.gl_widget.setCameraPosition(distance=self._default_distance)
+
+
+class RobotPosePanel(BasePlotPanel):
+    def __init__(
+        self,
+        activate_callback: Callable[[BasePlotPanel], None],
+        remove_callback: Callable[[BasePlotPanel], None],
+    ) -> None:
+        super().__init__(mode="robot", activate_callback=activate_callback, remove_callback=remove_callback)
+        self.parsed_log: ParsedLog | None = None
+        self.signal_lookup: dict[str, SignalNode] = {}
+        self.robot_model: RobotModel | None = None
+        self.robot_model_path: Path | None = None
+        self.joint_signal_map: dict[str, str] = {}
+        self.current_sample_index: int | None = None
+        self.angle_unit = "deg"
+        self._default_distance = 40.0
+        self._last_center = np.zeros(3, dtype=float)
+        self._view_center = np.zeros(3, dtype=float)
+        self._auto_fit_pending = True
+        self.line_item = None
+        self.joint_item = None
+        self.world_axis_items: list[object] = []
+        self.tool_axis_items: list[object] = []
+        self._gl_init_requested = False
+        self._gl_ready = False
+
+        self.load_model_button = QPushButton("Load URDF/Xacro")
+        self.load_model_button.clicked.connect(self._open_model_dialog)
+        self.unit_toggle_button = QPushButton("Unit: deg")
+        self.unit_toggle_button.clicked.connect(self._toggle_angle_unit)
+        self.header_layout.insertWidget(2, self.load_model_button)
+        self.header_layout.insertWidget(3, self.unit_toggle_button)
+
+        self.summary_label = QLabel("Follow: waiting for a hovered/clicked sample in X-T")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("color: #4b5563; padding-bottom: 4px;")
+        self.content_layout.addWidget(self.summary_label)
+
+        if GL_AVAILABLE:
+            self.gl_widget = None
+            self.grid_item = None
+            self.axis_item = None
+            self.gl_placeholder = QLabel("Initializing 3D robot view...")
+            self.gl_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.gl_placeholder.setMinimumHeight(320)
+            self.gl_placeholder.setStyleSheet("color: #6b7280; background: #f8fafc; border: 1px solid #e5e7eb;")
+            self.content_layout.addWidget(self.gl_placeholder, 1)
+        else:
+            self.gl_widget = None
+            self.grid_item = None
+            self.axis_item = None
+            self.gl_placeholder = None
+            missing_label = QLabel(
+                "3D dependencies are missing, so the robot pose view is unavailable.\n"
+                f"Install PyOpenGL and restart the app.\nError: {GL_IMPORT_ERROR}"
+            )
+            missing_label.setWordWrap(True)
+            missing_label.setStyleSheet("color: #b54708;")
+            self.content_layout.addWidget(missing_label)
+
+        self._update_detail_label()
+        self.message_label.setText("Load a URDF/Xacro model to preview the robot pose.")
+
+    @property
+    def supports_time_range(self) -> bool:
+        return False
+
+    def _update_detail_label(self) -> None:
+        model_name = self.robot_model_path.name if self.robot_model_path is not None else "No model"
+        self.detail_label.setText(f"Robot Pose | {model_name} | Angle unit={self.angle_unit}")
+
+    def _toggle_angle_unit(self) -> None:
+        self.angle_unit = "rad" if self.angle_unit == "deg" else "deg"
+        self.unit_toggle_button.setText(f"Unit: {self.angle_unit}")
+        self._update_detail_label()
+        self._refresh_pose()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        if GL_AVAILABLE and not self._gl_init_requested:
+            self._gl_init_requested = True
+            QTimer.singleShot(0, self._ensure_gl_widget)
+
+    def _ensure_gl_widget(self) -> None:
+        if not GL_AVAILABLE or self._gl_ready:
+            return
+
+        self.gl_widget = gl.GLViewWidget()
+        self.gl_widget.setMinimumHeight(320)
+        try:
+            self.gl_widget.setBackgroundColor("#f7fafc")
+        except Exception:  # pragma: no cover - backend dependent
+            pass
+        self.grid_item = gl.GLGridItem()
+        self.gl_widget.addItem(self.grid_item)
+        try:
+            self.grid_item.setColor((80, 80, 80, 90))
+        except Exception:  # pragma: no cover - backend dependent
+            pass
+        try:
+            self.axis_item = gl.GLAxisItem()
+            self.gl_widget.addItem(self.axis_item)
+        except Exception:  # pragma: no cover - backend dependent
+            self.axis_item = None
+        self.gl_widget.opts["center"] = QVector3D(0.0, 0.0, 0.0)
+        self.gl_widget.setCameraPosition(distance=self._default_distance)
+
+        if self.gl_placeholder is not None:
+            self.content_layout.replaceWidget(self.gl_placeholder, self.gl_widget)
+            self.gl_placeholder.hide()
+            self.gl_placeholder.deleteLater()
+            self.gl_placeholder = None
+        else:
+            self.content_layout.addWidget(self.gl_widget, 1)
+
+        self._gl_ready = True
+        self._refresh_pose()
+
+    def _open_model_dialog(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Robot Model",
+            str(self.robot_model_path.parent) if self.robot_model_path is not None else "",
+            "Robot Model (*.urdf *.xacro);;URDF Files (*.urdf);;Xacro Files (*.xacro);;All Files (*)",
+        )
+        if filename:
+            self.load_model_from_path(Path(filename))
+
+    def load_model_from_path(self, path: Path) -> None:
+        try:
+            self.robot_model = load_robot_model(path)
+        except RobotModelError as exc:
+            self.message_label.setText(str(exc))
+            self.emit_status(str(exc))
+            return
+
+        self.robot_model_path = path.expanduser().resolve()
+        self.joint_signal_map.clear()
+        self._auto_fit_pending = True
+        self._update_detail_label()
+        self._auto_map_joint_signals()
+        self._refresh_pose()
+
+    @staticmethod
+    def _joint_index_from_text(text: str) -> int | None:
+        match = re.search(r"(?:^|[^a-z])j(?:oint)?[_-]?(\d+)$", text.strip().lower())
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    @classmethod
+    def _joint_sort_key(cls, signal: SignalNode) -> tuple[int, int, str]:
+        text_parts = [signal.name, signal.full_path, *signal.path_parts]
+        has_joint_token = any("joint" in part.lower() for part in text_parts)
+        joint_index = None
+        for part in text_parts:
+            joint_index = cls._joint_index_from_text(part)
+            if joint_index is not None:
+                break
+        return (0 if has_joint_token else 1, joint_index if joint_index is not None else 10**6, signal.full_path)
+
+    @staticmethod
+    def _path_score(signal: SignalNode) -> tuple[int, int, int, str]:
+        parts_lower = [part.lower() for part in signal.path_parts]
+        full_path_lower = signal.full_path.lower()
+
+        source_score = 100
+        if "joint" in parts_lower:
+            source_score = 0
+        elif any(part.endswith("mcjoint") for part in parts_lower):
+            source_score = 10
+        elif any("joint" in part for part in parts_lower):
+            source_score = 20
+
+        metric_score = 50
+        if "pos" in parts_lower:
+            metric_score = 0
+        elif any(part.endswith("jpos") for part in parts_lower):
+            metric_score = 5
+        elif any("pos" in part for part in parts_lower):
+            metric_score = 10
+
+        penalty = 0
+        bad_keywords = (
+            "vel",
+            "acc",
+            "torq",
+            "ctrwd",
+            "stswd",
+            "modefb",
+            "actpls",
+            "setpls",
+            "followerrs",
+            "ipjvel",
+            "damp",
+            "outpos",
+            "status",
+            "port",
+        )
+        for keyword in bad_keywords:
+            if keyword in full_path_lower:
+                penalty += 20
+        if "**" in full_path_lower and "mcjoint" not in full_path_lower:
+            penalty += 10
+
+        return (source_score, metric_score, penalty, signal.full_path)
+
+    @classmethod
+    def _looks_like_joint_signal(cls, signal: SignalNode) -> bool:
+        text_parts = [signal.name, signal.full_path, *signal.path_parts]
+        if any("joint" in part.lower() for part in text_parts):
+            return True
+        return any(cls._joint_index_from_text(part) is not None for part in text_parts)
+
+    def _auto_map_joint_signals(self) -> None:
+        self.joint_signal_map.clear()
+        if self.robot_model is None or self.parsed_log is None:
+            return
+
+        candidates = [
+            signal
+            for signal in self.parsed_log.signals
+            if signal.available and signal.signal_id in self.parsed_log.signals_by_id
+            and self._looks_like_joint_signal(signal)
+        ]
+        candidates.sort(key=lambda signal: (*self._path_score(signal), *self._joint_sort_key(signal)))
+        movable_joints = self.robot_model.movable_joints
+        if not candidates or not movable_joints:
+            return
+
+        candidate_by_index: dict[int, SignalNode] = {}
+        for signal in candidates:
+            for part in (signal.name, signal.full_path, *signal.path_parts):
+                joint_index = self._joint_index_from_text(part)
+                if joint_index is None:
+                    continue
+                previous = candidate_by_index.get(joint_index)
+                if previous is None or self._path_score(signal) < self._path_score(previous):
+                    candidate_by_index[joint_index] = signal
+                    break
+
+        used_signal_ids: set[str] = set()
+        for joint in movable_joints:
+            joint_index = self._joint_index_from_text(joint.name)
+            if joint_index is not None and joint_index in candidate_by_index:
+                signal = candidate_by_index[joint_index]
+                self.joint_signal_map[joint.name] = signal.signal_id
+                used_signal_ids.add(signal.signal_id)
+
+        sequential_signals = [
+            signal
+            for signal in candidates
+            if signal.signal_id not in used_signal_ids
+        ]
+        sequential_signals.sort(key=lambda signal: (*self._path_score(signal), *self._joint_sort_key(signal)))
+        for joint in movable_joints:
+            if joint.name in self.joint_signal_map or not sequential_signals:
+                continue
+            signal = sequential_signals.pop(0)
+            self.joint_signal_map[joint.name] = signal.signal_id
+
+    def update_plot(self, parsed_log: ParsedLog | None, signal_lookup: dict[str, SignalNode]) -> None:
+        previous_log = self.parsed_log
+        self.parsed_log = parsed_log
+        self.signal_lookup = signal_lookup
+        if parsed_log is not previous_log:
+            self._auto_fit_pending = True
+        if parsed_log is not None:
+            sample_count = parsed_log.time_seconds.shape[0]
+            if sample_count > 0 and (
+                self.current_sample_index is None or self.current_sample_index < 0 or self.current_sample_index >= sample_count
+            ):
+                self.current_sample_index = 0
+
+        self._auto_map_joint_signals()
+        self._refresh_pose()
+
+    def sync_sample_index(self, index: int | None) -> None:
+        if index is None or self.parsed_log is None:
+            return
+        sample_count = self.parsed_log.time_seconds.shape[0]
+        if sample_count == 0:
+            return
+        self.current_sample_index = max(0, min(int(index), sample_count - 1))
+        self._refresh_pose()
+
+    def focus_sample_index(self, index: int) -> None:
+        self.sync_sample_index(index)
+
+    def _joint_values_for_index(self, sample_index: int) -> dict[str, float]:
+        if self.parsed_log is None or self.robot_model is None:
+            return {}
+
+        joint_values: dict[str, float] = {}
+        for joint in self.robot_model.movable_joints:
+            signal_id = self.joint_signal_map.get(joint.name)
+            if signal_id is None or signal_id not in self.parsed_log.signals_by_id:
+                continue
+            raw_value = float(self.parsed_log.get_series(signal_id)[sample_index])
+            if joint.joint_type in {"revolute", "continuous"} and self.angle_unit == "deg":
+                raw_value = float(np.deg2rad(raw_value))
+            joint_values[joint.name] = raw_value
+        return joint_values
+
+    def _format_joint_summary(self, sample_index: int) -> str:
+        if self.parsed_log is None or self.robot_model is None:
+            return "Follow: unavailable"
+
+        joint_parts: list[str] = []
+        for joint in self.robot_model.movable_joints[:6]:
+            signal_id = self.joint_signal_map.get(joint.name)
+            if signal_id is None or signal_id not in self.parsed_log.signals_by_id:
+                continue
+            raw_value = float(self.parsed_log.get_series(signal_id)[sample_index])
+            signal = self.signal_lookup.get(signal_id)
+            source_label = signal.full_path if signal is not None else signal_id
+            joint_parts.append(f"{joint.name}<-{source_label}={raw_value:.3f}")
+
+        if not joint_parts:
+            return f"Follow: sample={sample_index} | no mapped joint values"
+
+        time_seconds = float(self.parsed_log.time_seconds[sample_index])
+        return f"Follow: sample={sample_index} | t={time_seconds:.3f}s | " + " | ".join(joint_parts)
+
+    def _clear_robot_item(self) -> None:
+        if self.gl_widget is not None and self.line_item is not None:
+            self.gl_widget.removeItem(self.line_item)
+            self.line_item = None
+        if self.gl_widget is not None and self.joint_item is not None:
+            self.gl_widget.removeItem(self.joint_item)
+            self.joint_item = None
+        if self.gl_widget is not None:
+            for item in self.world_axis_items:
+                self.gl_widget.removeItem(item)
+            for item in self.tool_axis_items:
+                self.gl_widget.removeItem(item)
+        self.world_axis_items.clear()
+        self.tool_axis_items.clear()
+
+    @staticmethod
+    def _build_axis_items(
+        origin: np.ndarray,
+        rotation: np.ndarray,
+        length: float,
+        colors: tuple[tuple[float, float, float, float], tuple[float, float, float, float], tuple[float, float, float, float]],
+        *,
+        width: float,
+    ) -> list[object]:
+        axis_specs = (
+            (rotation[:, 0], colors[0]),
+            (rotation[:, 1], colors[1]),
+            (rotation[:, 2], colors[2]),
+        )
+        items: list[object] = []
+        for axis_vector, color in axis_specs:
+            points = np.vstack([origin, origin + axis_vector * length]).astype(np.float32)
+            items.append(
+                gl.GLLinePlotItem(
+                    pos=points,
+                    color=color,
+                    width=width,
+                    antialias=True,
+                    mode="line_strip",
+                )
+            )
+        return items
+
+    def _refresh_pose(self) -> None:
+        self._update_detail_label()
+        if not GL_AVAILABLE:
+            self.message_label.setText("Robot pose view unavailable. Install PyOpenGL first.")
+            self.summary_label.setText("Follow: unavailable")
+            return
+        if self.gl_widget is None:
+            self.message_label.setText("Preparing 3D robot view...")
+            self.summary_label.setText("Follow: initializing 3D view")
+            return
+
+        self._clear_robot_item()
+
+        if self.parsed_log is None:
+            self.message_label.setText("Load a log file first, then open a robot model.")
+            self.summary_label.setText("Follow: waiting for log data")
+            return
+        if self.robot_model is None:
+            self.message_label.setText("Load a URDF/Xacro model to preview the robot pose.")
+            self.summary_label.setText("Follow: waiting for robot model")
+            return
+        if not self.robot_model.movable_joints:
+            self.message_label.setText("The robot model has no movable joints.")
+            self.summary_label.setText("Follow: robot model has no movable joints")
+            return
+        if not self.joint_signal_map:
+            self.message_label.setText("No joint signal mapping found. Provide Joint signals such as J1/J2/J3.")
+            self.summary_label.setText("Follow: no mapped joint signals")
+            return
+
+        sample_count = self.parsed_log.time_seconds.shape[0]
+        if sample_count == 0:
+            self.message_label.setText("The current log has no valid samples.")
+            self.summary_label.setText("Follow: log contains no valid samples")
+            return
+
+        sample_index = 0 if self.current_sample_index is None else max(0, min(self.current_sample_index, sample_count - 1))
+        joint_values = self._joint_values_for_index(sample_index)
+        state = self.robot_model.compute_state(joint_values)
+        segments = state.segments
+        if not segments:
+            self.message_label.setText("The robot model produced no drawable segments.")
+            return
+
+        line_points = np.array([point for segment in segments for point in segment], dtype=np.float32)
+        all_points = line_points.reshape(-1, 3)
+        min_point = all_points.min(axis=0)
+        max_point = all_points.max(axis=0)
+        center = (min_point + max_point) / 2.0
+        self._last_center = center.astype(float)
+
+        self.line_item = gl.GLLinePlotItem(
+            pos=all_points.astype(np.float32),
+            color=ROBOT_LINK_COLOR,
+            width=4,
+            antialias=True,
+            mode="lines",
+        )
+        self.gl_widget.addItem(self.line_item)
+
+        if state.joint_positions:
+            joint_points = np.array(state.joint_positions, dtype=np.float32)
+            self.joint_item = gl.GLScatterPlotItem(
+                pos=joint_points,
+                color=ROBOT_JOINT_COLOR,
+                size=10.0,
+                pxMode=True,
+            )
+            self.gl_widget.addItem(self.joint_item)
+
+        span = np.maximum(max_point - min_point, 1e-6)
+        max_span = max(float(np.max(span)), 1.0)
+        actual_span = max(float(np.max(max_point - min_point)), 1e-6)
+        grid_scale = max(actual_span / 6.0, 0.05)
+        distance = max(actual_span * 2.4, 1.2)
+        axis_length = max(actual_span * 0.22, 0.08)
+        self.grid_item.resetTransform()
+        self.grid_item.scale(grid_scale, grid_scale, 1.0)
+        if self.axis_item is not None:
+            try:
+                self.axis_item.setSize(axis_length * 0.6, axis_length * 0.6, axis_length * 0.6)
+            except Exception:  # pragma: no cover - backend dependent
+                pass
+        self.world_axis_items = self._build_axis_items(
+            origin=np.zeros(3, dtype=float),
+            rotation=np.eye(3, dtype=float),
+            length=axis_length,
+            colors=(WORLD_AXIS_X_COLOR, WORLD_AXIS_Y_COLOR, WORLD_AXIS_Z_COLOR),
+            width=2,
+        )
+        for item in self.world_axis_items:
+            self.gl_widget.addItem(item)
+
+        tool_transform = state.tool_transform
+        self.tool_axis_items = self._build_axis_items(
+            origin=tool_transform[:3, 3],
+            rotation=tool_transform[:3, :3],
+            length=max(axis_length * 0.6, 0.05),
+            colors=(AXIS_X_COLOR, AXIS_Y_COLOR, AXIS_Z_COLOR),
+            width=3,
+        )
+        for item in self.tool_axis_items:
+            self.gl_widget.addItem(item)
+
+        if self._auto_fit_pending:
+            self._view_center = center.astype(float)
+            self._default_distance = distance
+            self.gl_widget.opts["center"] = QVector3D(
+                float(self._view_center[0]),
+                float(self._view_center[1]),
+                float(self._view_center[2]),
+            )
+            self.gl_widget.setCameraPosition(distance=self._default_distance)
+            self._auto_fit_pending = False
+
+        mapped_count = len(joint_values)
+        total_count = len(self.robot_model.movable_joints)
+        time_seconds = float(self.parsed_log.time_seconds[sample_index])
+        self.message_label.setText(
+            f"Robot pose | sample={sample_index} | t={time_seconds:.3f}s | mapped joints={mapped_count}/{total_count}"
+        )
+        self.summary_label.setText(self._format_joint_summary(sample_index))
+        self.emit_status(
+            f"Robot pose | sample={sample_index} | t={time_seconds:.3f}s | model={self.robot_model.name}"
+        )
+
+    def reset_view(self) -> None:
+        if self.gl_widget is not None:
+            self._view_center = self._last_center.copy()
+            self.gl_widget.opts["center"] = QVector3D(
+                float(self._view_center[0]),
+                float(self._view_center[1]),
+                float(self._view_center[2]),
+            )
             self.gl_widget.setCameraPosition(distance=self._default_distance)
 
 
