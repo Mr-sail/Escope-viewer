@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QAction, QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -69,12 +69,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("机器人状态曲线查看器")
         self.resize(1580, 920)
+        self.setAcceptDrops(True)
 
         self.parsed_log: ParsedLog | None = None
         self.signal_lookup: dict[str, SignalNode] = {}
         self.signal_item_map: dict[str, QTreeWidgetItem] = {}
         self.panels: list[BasePlotPanel] = []
         self.panel_windows: dict[BasePlotPanel, PlotSubWindow] = {}
+        self._drop_targets: list[QWidget] = []
         self.active_panel: BasePlotPanel | None = None
         self.detected_events: list[LogEvent] = []
         self._suppress_item_changed = False
@@ -85,6 +87,63 @@ class MainWindow(QMainWindow):
 
         if self._initial_path is not None:
             self.load_file(self._initial_path)
+
+    @staticmethod
+    def _extract_dropped_log_path(event) -> Path | None:
+        mime_data = event.mimeData()
+        if not mime_data.hasUrls():
+            return None
+
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_file() and path.suffix.lower() == ".txt":
+                return path
+        return None
+
+    def _register_drop_target(self, widget: QWidget | None) -> None:
+        if widget is None or widget in self._drop_targets:
+            return
+        widget.setAcceptDrops(True)
+        widget.installEventFilter(self)
+        self._drop_targets.append(widget)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt naming
+        if self._extract_dropped_log_path(event) is not None:
+            event.acceptProposedAction()
+            self.cursor_label.setText("松开鼠标以打开日志文件")
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802 - Qt naming
+        if self._extract_dropped_log_path(event) is not None:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt naming
+        path = self._extract_dropped_log_path(event)
+        if path is None:
+            event.ignore()
+            self.cursor_label.setText("仅支持拖入本地 txt 日志文件")
+            return
+
+        event.acceptProposedAction()
+        self.load_file(path)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched in self._drop_targets:
+            if event.type() == QEvent.Type.DragEnter:
+                self.dragEnterEvent(event)
+                return event.isAccepted()
+            if event.type() == QEvent.Type.DragMove:
+                self.dragMoveEvent(event)
+                return event.isAccepted()
+            if event.type() == QEvent.Type.Drop:
+                self.dropEvent(event)
+                return event.isAccepted()
+        return super().eventFilter(watched, event)
 
     def _build_ui(self) -> None:
         open_action = QAction("打开文件", self)
@@ -197,6 +256,12 @@ class MainWindow(QMainWindow):
         self.workspace_splitter = workspace_splitter
         self._event_panel_expanded_height = 170
         self.event_table.hide()
+        self._register_drop_target(central)
+        self._register_drop_target(self.tree)
+        self._register_drop_target(self.mdi_area)
+        self._register_drop_target(self.mdi_area.viewport())
+        self._register_drop_target(self.event_panel)
+        self._register_drop_target(self.event_table)
         self.toggle_events_button.setText("显示事件")
 
         root_layout.addLayout(controls_layout)
@@ -401,6 +466,13 @@ class MainWindow(QMainWindow):
         self.mdi_area.addSubWindow(subwindow)
         self.panels.append(panel)
         self.panel_windows[panel] = subwindow
+        self._register_drop_target(subwindow)
+        self._register_drop_target(panel)
+        if isinstance(panel, Plot2DPanel):
+            self._register_drop_target(panel.plot_widget)
+            self._register_drop_target(panel.plot_widget.viewport())
+        elif isinstance(panel, Plot3DPanel):
+            self._register_drop_target(panel.gl_widget)
         self._update_panel_titles()
         panel.update_plot(self.parsed_log, self.signal_lookup)
         self._position_new_panel(subwindow, mode)
