@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
 import numpy as np
@@ -26,6 +28,21 @@ class RobotJoint:
         return self.joint_type in {"revolute", "continuous", "prismatic"}
 
 
+@dataclass(frozen=True)
+class RobotVisualMesh:
+    name: str
+    link_name: str
+    filename: str
+    path: Path | None
+    origin_xyz: np.ndarray
+    origin_rpy: np.ndarray
+    scale: np.ndarray
+
+    @property
+    def origin_transform(self) -> np.ndarray:
+        return _compose_transform(self.origin_xyz, self.origin_rpy)
+
+
 @dataclass
 class RobotModel:
     name: str
@@ -33,6 +50,7 @@ class RobotModel:
     joints: list[RobotJoint]
     links: tuple[str, ...]
     children_by_link: dict[str, list[RobotJoint]]
+    visual_meshes: tuple[RobotVisualMesh, ...] = ()
 
     @property
     def movable_joints(self) -> list[RobotJoint]:
@@ -182,6 +200,93 @@ def _load_model_xml(path: Path) -> str:
         raise RobotModelError(f"xacro 展开失败: {exc}") from exc
 
 
+def _candidate_package_roots(model_path: Path) -> list[Path]:
+    roots = [model_path.parent, *model_path.parent.parents]
+    for entry in os.environ.get("ROS_PACKAGE_PATH", "").split(os.pathsep):
+        if entry.strip():
+            roots.append(Path(entry).expanduser())
+    return roots
+
+
+def _resolve_package_mesh_path(package_name: str, relative_path: str, model_path: Path) -> Path | None:
+    relative = Path(relative_path.lstrip("/"))
+    for root in _candidate_package_roots(model_path):
+        if root.name == package_name:
+            candidate = (root / relative).resolve()
+            if candidate.exists():
+                return candidate
+        candidate = (root / package_name / relative).resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_mesh_path(filename: str, model_path: Path) -> Path | None:
+    raw_filename = filename.strip()
+    if not raw_filename:
+        return None
+
+    parsed = urlparse(raw_filename)
+    if parsed.scheme in {"package", "model"}:
+        package_name = unquote(parsed.netloc)
+        relative_path = unquote(parsed.path.lstrip("/"))
+        if package_name and relative_path:
+            return _resolve_package_mesh_path(package_name, relative_path, model_path)
+        return None
+    if parsed.scheme == "file":
+        return Path(unquote(parsed.path)).expanduser().resolve()
+    if parsed.scheme and parsed.scheme not in {"package", "model", "file"}:
+        return None
+
+    mesh_path = Path(unquote(raw_filename)).expanduser()
+    if not mesh_path.is_absolute():
+        mesh_path = model_path.parent / mesh_path
+    return mesh_path.resolve()
+
+
+def _parse_visual_meshes(root: ET.Element, model_path: Path) -> tuple[RobotVisualMesh, ...]:
+    visual_meshes: list[RobotVisualMesh] = []
+    for link_element in root.findall("link"):
+        link_name = (link_element.attrib.get("name") or "").strip()
+        if not link_name:
+            continue
+
+        for index, visual_element in enumerate(link_element.findall("visual"), start=1):
+            geometry_element = visual_element.find("geometry")
+            if geometry_element is None:
+                continue
+            mesh_element = geometry_element.find("mesh")
+            if mesh_element is None:
+                continue
+            filename = (mesh_element.attrib.get("filename") or mesh_element.attrib.get("url") or "").strip()
+            if not filename:
+                continue
+
+            origin_element = visual_element.find("origin")
+            origin_xyz = _parse_vector(
+                origin_element.attrib.get("xyz") if origin_element is not None else None,
+                default=(0.0, 0.0, 0.0),
+            )
+            origin_rpy = _parse_vector(
+                origin_element.attrib.get("rpy") if origin_element is not None else None,
+                default=(0.0, 0.0, 0.0),
+            )
+            scale = _parse_vector(mesh_element.attrib.get("scale"), default=(1.0, 1.0, 1.0))
+            visual_name = (visual_element.attrib.get("name") or f"{link_name}_visual_{index}").strip()
+            visual_meshes.append(
+                RobotVisualMesh(
+                    name=visual_name,
+                    link_name=link_name,
+                    filename=filename,
+                    path=_resolve_mesh_path(filename, model_path),
+                    origin_xyz=origin_xyz,
+                    origin_rpy=origin_rpy,
+                    scale=scale,
+                )
+            )
+    return tuple(visual_meshes)
+
+
 def load_robot_model(path: str | Path) -> RobotModel:
     model_path = Path(path).expanduser().resolve()
     if not model_path.exists():
@@ -198,6 +303,7 @@ def load_robot_model(path: str | Path) -> RobotModel:
         raise RobotModelError("模型根节点不是 <robot>，请提供 URDF 或可展开的 xacro 文件。")
 
     links = tuple(link.attrib.get("name", "").strip() for link in root.findall("link") if link.attrib.get("name"))
+    visual_meshes = _parse_visual_meshes(root, model_path)
     joints: list[RobotJoint] = []
 
     for joint_element in root.findall("joint"):
@@ -278,4 +384,5 @@ def load_robot_model(path: str | Path) -> RobotModel:
         joints=ordered_joints,
         links=links,
         children_by_link=children_by_link,
+        visual_meshes=visual_meshes,
     )

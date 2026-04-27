@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .mesh_loader import LoadedMesh, MeshLoadError, load_mesh
 from .models import ParsedLog, SignalNode
 from .robot_model import RobotModel, RobotModelError, load_robot_model
 
@@ -35,6 +36,8 @@ except Exception as exc:  # pragma: no cover - depends on optional local depende
 
 ROBOT_LINK_COLOR = (0.09, 0.43, 0.86, 1.0)
 ROBOT_JOINT_COLOR = (0.98, 0.62, 0.17, 1.0)
+ROBOT_MESH_COLOR = (0.52, 0.62, 0.72, 0.58)
+ROBOT_MESH_EDGE_COLOR = (0.18, 0.24, 0.32, 0.22)
 AXIS_X_COLOR = (0.89, 0.16, 0.16, 0.9)
 AXIS_Y_COLOR = (0.10, 0.64, 0.23, 0.9)
 AXIS_Z_COLOR = (0.13, 0.44, 0.82, 0.9)
@@ -947,6 +950,9 @@ class RobotPosePanel(BasePlotPanel):
         self._auto_fit_pending = True
         self.line_item = None
         self.joint_item = None
+        self.mesh_items: list[object] = []
+        self._mesh_cache: dict[Path, LoadedMesh] = {}
+        self._mesh_load_errors: dict[str, str] = {}
         self.world_axis_items: list[object] = []
         self.tool_axis_items: list[object] = []
         self._gl_init_requested = False
@@ -1064,6 +1070,8 @@ class RobotPosePanel(BasePlotPanel):
 
         self.robot_model_path = path.expanduser().resolve()
         self.joint_signal_map.clear()
+        self._mesh_cache.clear()
+        self._mesh_load_errors.clear()
         self._auto_fit_pending = True
         self._update_detail_label()
         self._auto_map_joint_signals()
@@ -1258,10 +1266,13 @@ class RobotPosePanel(BasePlotPanel):
             self.gl_widget.removeItem(self.joint_item)
             self.joint_item = None
         if self.gl_widget is not None:
+            for item in self.mesh_items:
+                self.gl_widget.removeItem(item)
             for item in self.world_axis_items:
                 self.gl_widget.removeItem(item)
             for item in self.tool_axis_items:
                 self.gl_widget.removeItem(item)
+        self.mesh_items.clear()
         self.world_axis_items.clear()
         self.tool_axis_items.clear()
 
@@ -1293,6 +1304,26 @@ class RobotPosePanel(BasePlotPanel):
             )
         return items
 
+    def _load_visual_mesh(self, mesh_path: Path) -> LoadedMesh | None:
+        cached_mesh = self._mesh_cache.get(mesh_path)
+        if cached_mesh is not None:
+            return cached_mesh
+
+        try:
+            loaded_mesh = load_mesh(mesh_path)
+        except MeshLoadError as exc:
+            self._mesh_load_errors[str(mesh_path)] = str(exc)
+            return None
+
+        self._mesh_cache[mesh_path] = loaded_mesh
+        return loaded_mesh
+
+    @staticmethod
+    def _transform_vertices(vertices: np.ndarray, transform: np.ndarray) -> np.ndarray:
+        homogeneous = np.ones((vertices.shape[0], 4), dtype=np.float32)
+        homogeneous[:, :3] = vertices.astype(np.float32, copy=False)
+        return (homogeneous @ transform.T.astype(np.float32))[:, :3]
+
     def _refresh_pose(self) -> None:
         self._update_detail_label()
         if not GL_AVAILABLE:
@@ -1306,31 +1337,33 @@ class RobotPosePanel(BasePlotPanel):
 
         self._clear_robot_item()
 
-        if self.parsed_log is None:
-            self.message_label.setText("Load a log file first, then open a robot model.")
-            self.summary_label.setText("Follow: waiting for log data")
-            return
         if self.robot_model is None:
             self.message_label.setText("Load a URDF/Xacro model to preview the robot pose.")
             self.summary_label.setText("Follow: waiting for robot model")
             return
-        if not self.robot_model.movable_joints:
-            self.message_label.setText("The robot model has no movable joints.")
-            self.summary_label.setText("Follow: robot model has no movable joints")
-            return
-        if not self.joint_signal_map:
-            self.message_label.setText("No joint signal mapping found. Provide Joint signals such as J1/J2/J3.")
-            self.summary_label.setText("Follow: no mapped joint signals")
-            return
 
-        sample_count = self.parsed_log.time_seconds.shape[0]
-        if sample_count == 0:
-            self.message_label.setText("The current log has no valid samples.")
-            self.summary_label.setText("Follow: log contains no valid samples")
-            return
+        sample_index: int | None = None
+        time_seconds: float | None = None
+        joint_values: dict[str, float] = {}
+        follow_summary = "Follow: default robot pose"
+        if self.parsed_log is None:
+            follow_summary = "Follow: default robot pose | no log loaded"
+        elif not self.robot_model.movable_joints:
+            follow_summary = "Follow: default robot pose | robot model has no movable joints"
+        elif not self.joint_signal_map:
+            follow_summary = "Follow: default robot pose | no mapped joint signals"
+        else:
+            sample_count = self.parsed_log.time_seconds.shape[0]
+            if sample_count > 0:
+                sample_index = (
+                    0 if self.current_sample_index is None else max(0, min(self.current_sample_index, sample_count - 1))
+                )
+                time_seconds = float(self.parsed_log.time_seconds[sample_index])
+                joint_values = self._joint_values_for_index(sample_index)
+                follow_summary = self._format_joint_summary(sample_index)
+            else:
+                follow_summary = "Follow: default robot pose | log contains no valid samples"
 
-        sample_index = 0 if self.current_sample_index is None else max(0, min(self.current_sample_index, sample_count - 1))
-        joint_values = self._joint_values_for_index(sample_index)
         state = self.robot_model.compute_state(joint_values)
         segments = state.segments
         if not segments:
@@ -1338,14 +1371,58 @@ class RobotPosePanel(BasePlotPanel):
             return
 
         line_points = np.array([point for segment in segments for point in segment], dtype=np.float32)
-        all_points = line_points.reshape(-1, 3)
+        mesh_points: list[np.ndarray] = []
+        mesh_drawn_count = 0
+        mesh_skipped_count = 0
+        for visual_mesh in self.robot_model.visual_meshes:
+            if visual_mesh.path is None:
+                self._mesh_load_errors[visual_mesh.filename] = f"无法根据 URDF 路径解析 mesh: {visual_mesh.filename}"
+                mesh_skipped_count += 1
+                continue
+
+            loaded_mesh = self._load_visual_mesh(visual_mesh.path)
+            if loaded_mesh is None:
+                mesh_skipped_count += 1
+                continue
+            link_transform = state.link_transforms.get(visual_mesh.link_name)
+            if link_transform is None:
+                mesh_skipped_count += 1
+                continue
+
+            scaled_vertices = loaded_mesh.vertices * visual_mesh.scale.astype(np.float32)
+            transformed_vertices = self._transform_vertices(
+                scaled_vertices,
+                link_transform @ visual_mesh.origin_transform,
+            )
+            mesh_points.append(transformed_vertices)
+            mesh_data = gl.MeshData(
+                vertexes=transformed_vertices.astype(np.float32, copy=False),
+                faces=loaded_mesh.faces,
+            )
+            mesh_item = gl.GLMeshItem(
+                meshdata=mesh_data,
+                color=ROBOT_MESH_COLOR,
+                smooth=False,
+                drawEdges=True,
+                edgeColor=ROBOT_MESH_EDGE_COLOR,
+                shader="shaded",
+                glOptions="translucent",
+            )
+            self.mesh_items.append(mesh_item)
+            self.gl_widget.addItem(mesh_item)
+            mesh_drawn_count += 1
+
+        if mesh_points:
+            all_points = np.vstack([line_points.reshape(-1, 3), *mesh_points])
+        else:
+            all_points = line_points.reshape(-1, 3)
         min_point = all_points.min(axis=0)
         max_point = all_points.max(axis=0)
         center = (min_point + max_point) / 2.0
         self._last_center = center.astype(float)
 
         self.line_item = gl.GLLinePlotItem(
-            pos=all_points.astype(np.float32),
+            pos=line_points.reshape(-1, 3).astype(np.float32),
             color=ROBOT_LINK_COLOR,
             width=4,
             antialias=True,
@@ -1410,13 +1487,23 @@ class RobotPosePanel(BasePlotPanel):
 
         mapped_count = len(joint_values)
         total_count = len(self.robot_model.movable_joints)
-        time_seconds = float(self.parsed_log.time_seconds[sample_index])
-        self.message_label.setText(
-            f"Robot pose | sample={sample_index} | t={time_seconds:.3f}s | mapped joints={mapped_count}/{total_count}"
+        mesh_status = ""
+        if self.robot_model.visual_meshes:
+            mesh_status = f" | meshes={mesh_drawn_count}/{len(self.robot_model.visual_meshes)}"
+            if mesh_skipped_count:
+                mesh_status += f" skipped={mesh_skipped_count}"
+                if self._mesh_load_errors:
+                    first_error = next(iter(self._mesh_load_errors.values()))
+                    mesh_status += f" | mesh error={first_error[:120]}"
+        pose_status = "default pose" if sample_index is None or time_seconds is None else (
+            f"sample={sample_index} | t={time_seconds:.3f}s"
         )
-        self.summary_label.setText(self._format_joint_summary(sample_index))
+        self.message_label.setText(
+            f"Robot pose | {pose_status} | mapped joints={mapped_count}/{total_count}{mesh_status}"
+        )
+        self.summary_label.setText(follow_summary)
         self.emit_status(
-            f"Robot pose | sample={sample_index} | t={time_seconds:.3f}s | model={self.robot_model.name}"
+            f"Robot pose | {pose_status} | model={self.robot_model.name}"
         )
 
     def reset_view(self) -> None:
