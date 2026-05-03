@@ -10,6 +10,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFrame,
     QFileDialog,
     QHBoxLayout,
@@ -255,6 +256,11 @@ class Plot2DPanel(BasePlotPanel):
         self._measurement_indices: list[int] = []
         self._measurement_status: str | None = None
         self._current_cursor_index: int | None = None
+        self._zoom_mode = "auto"
+        self._display_series_by_id: dict[str, np.ndarray] = {}
+        self._xt_display_mode = "raw"
+        self._xt_mode_group: QButtonGroup | None = None
+        self._xt_mode_buttons: dict[str, QPushButton] = {}
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.plot_widget = AxisZoomPlotWidget(background="w")
@@ -299,6 +305,8 @@ class Plot2DPanel(BasePlotPanel):
         self.value_overlay.show()
 
         self.equal_scale_button: QPushButton | None = None
+        if self.mode == "xt":
+            self._build_xt_mode_selector()
         if self.mode == "xy":
             self.equal_scale_button = QPushButton("1:1")
             self.equal_scale_button.setCheckable(True)
@@ -324,13 +332,92 @@ class Plot2DPanel(BasePlotPanel):
             return 2
         return None
 
-    def set_zoom_mode(self, mode: str) -> None:
-        self.plot_widget.set_zoom_mode(mode)
-        if mode == "auto":
-            default_mode = "X-T" if self.mode == "xt" else "X-Y"
-            self.detail_label.setText(f"Wheel: Auto | Hover axis to zoom X/Y | Plot area={default_mode}")
+    def _build_xt_mode_selector(self) -> None:
+        mode_widget = QWidget(self)
+        mode_layout = QHBoxLayout(mode_widget)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.setSpacing(4)
+
+        self._xt_mode_group = QButtonGroup(self)
+        self._xt_mode_group.setExclusive(True)
+
+        button_specs = (
+            ("raw", "Raw", "Plot the original signal values"),
+            ("diff1", "D1", "Plot the first sample-to-sample difference"),
+            ("diff2", "D2", "Plot the second sample-to-sample difference"),
+        )
+        for mode_key, label, tooltip in button_specs:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(tooltip)
+            button.setMinimumWidth(44)
+            button.clicked.connect(lambda checked=False, selected=mode_key: self._set_xt_display_mode(selected))
+            self._xt_mode_group.addButton(button)
+            self._xt_mode_buttons[mode_key] = button
+            mode_layout.addWidget(button)
+
+        self._xt_mode_buttons[self._xt_display_mode].setChecked(True)
+        self.header_layout.insertWidget(1, mode_widget)
+
+    @staticmethod
+    def _xt_mode_label(mode: str) -> str:
+        labels = {
+            "raw": "Raw",
+            "diff1": "1st Difference",
+            "diff2": "2nd Difference",
+        }
+        return labels.get(mode, "Raw")
+
+    @staticmethod
+    def _xt_mode_suffix(mode: str) -> str:
+        suffixes = {
+            "raw": "",
+            "diff1": "D1",
+            "diff2": "D2",
+        }
+        return suffixes.get(mode, "")
+
+    def _set_xt_display_mode(self, mode: str) -> None:
+        if self.mode != "xt":
             return
-        self.detail_label.setText(f"Wheel locked: {mode.upper()}")
+        if mode not in {"raw", "diff1", "diff2"}:
+            return
+        if mode == self._xt_display_mode:
+            button = self._xt_mode_buttons.get(mode)
+            if button is not None and not button.isChecked():
+                button.setChecked(True)
+            return
+
+        self._xt_display_mode = mode
+        button = self._xt_mode_buttons.get(mode)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        self._refresh_detail_label()
+
+        if self.parsed_log is None:
+            return
+
+        current_index = self._current_cursor_index
+        self.update_plot(self.parsed_log, self.signal_lookup)
+        self.reset_view()
+        if current_index is not None:
+            self.sync_cursor_to_index(current_index)
+
+    def _refresh_detail_label(self) -> None:
+        if self._zoom_mode == "auto":
+            default_mode = "X-T" if self.mode == "xt" else "X-Y"
+            detail = f"Wheel: Auto | Hover axis to zoom X/Y | Plot area={default_mode}"
+        else:
+            detail = f"Wheel locked: {self._zoom_mode.upper()}"
+
+        if self.mode == "xt":
+            detail = f"{detail} | Series: {self._xt_mode_label(self._xt_display_mode)}"
+        self.detail_label.setText(detail)
+
+    def set_zoom_mode(self, mode: str) -> None:
+        self._zoom_mode = mode
+        self.plot_widget.set_zoom_mode(mode)
+        self._refresh_detail_label()
 
     def set_cursor_sync_callback(self, callback: Callable[[int | None], None]) -> None:
         self._cursor_sync_callback = callback
@@ -352,13 +439,17 @@ class Plot2DPanel(BasePlotPanel):
     def _series_color(index: int) -> str:
         return MainPalette.colors[index % len(MainPalette.colors)]
 
+    @staticmethod
+    def _format_numeric_value(value: float) -> str:
+        return f"{value:.6f}" if np.isfinite(value) else "n/a"
+
     def _format_overlay_rows(self, rows: list[tuple[str, float, str]]) -> str:
         html_rows = []
         for label, value, color in rows:
             safe_label = html.escape(label)
             html_rows.append(
                 f"<span style='color:{color}; font-weight:600;'>{safe_label}</span>: "
-                f"<span>{value:.6f}</span>"
+                f"<span>{self._format_numeric_value(value)}</span>"
             )
         return "<br>".join(html_rows) if html_rows else "No values"
 
@@ -366,6 +457,7 @@ class Plot2DPanel(BasePlotPanel):
         for curve in self.curves:
             self.plot_widget.removeItem(curve)
         self.curves.clear()
+        self._display_series_by_id.clear()
         if self.legend is not None:
             self.legend.clear()
         self._default_ranges = None
@@ -417,9 +509,57 @@ class Plot2DPanel(BasePlotPanel):
         padding = (max_value - min_value) * 0.05
         return min_value - padding, max_value + padding
 
+    @staticmethod
+    def _build_xt_display_series(series: np.ndarray, mode: str) -> np.ndarray:
+        values = np.asarray(series, dtype=float)
+        if mode == "raw":
+            return values
+        if mode == "diff1":
+            derived = np.full(values.shape, np.nan, dtype=float)
+            if values.size >= 2:
+                derived[1:] = np.diff(values)
+            return derived
+        if mode == "diff2":
+            derived = np.full(values.shape, np.nan, dtype=float)
+            if values.size >= 3:
+                derived[2:] = np.diff(values, n=2)
+            return derived
+        raise ValueError(f"Unsupported X-T display mode: {mode}")
+
+    def _get_display_series(self, signal_id: str) -> np.ndarray:
+        cached = self._display_series_by_id.get(signal_id)
+        if cached is not None:
+            return cached
+
+        assert self.parsed_log is not None
+        series = self.parsed_log.get_series(signal_id)
+        if self.mode == "xt":
+            cached = self._build_xt_display_series(series, self._xt_display_mode)
+        else:
+            cached = np.asarray(series, dtype=float)
+        self._display_series_by_id[signal_id] = cached
+        return cached
+
+    def _xt_display_signal_label(self, signal: SignalNode) -> str:
+        label = self._display_signal_label(signal)
+        suffix = self._xt_mode_suffix(self._xt_display_mode)
+        return label if not suffix else f"{label} ({suffix})"
+
     def _set_default_ranges(self, x_values: np.ndarray, y_values: np.ndarray) -> None:
-        x_min, x_max = self._compute_padded_range(float(np.min(x_values)), float(np.max(x_values)))
-        y_min, y_max = self._compute_padded_range(float(np.min(y_values)), float(np.max(y_values)))
+        x_finite = np.asarray(x_values, dtype=float)
+        y_finite = np.asarray(y_values, dtype=float)
+        x_finite = x_finite[np.isfinite(x_finite)]
+        y_finite = y_finite[np.isfinite(y_finite)]
+
+        if x_finite.size == 0:
+            x_min, x_max = -1.0, 1.0
+        else:
+            x_min, x_max = self._compute_padded_range(float(np.min(x_finite)), float(np.max(x_finite)))
+
+        if y_finite.size == 0:
+            y_min, y_max = -1.0, 1.0
+        else:
+            y_min, y_max = self._compute_padded_range(float(np.min(y_finite)), float(np.max(y_finite)))
         self._default_ranges = ((x_min, x_max), (y_min, y_max))
 
     def _apply_default_ranges(self) -> None:
@@ -448,7 +588,7 @@ class Plot2DPanel(BasePlotPanel):
 
     def _update_xt_plot(self, parsed_log: ParsedLog, signal_lookup: dict[str, SignalNode]) -> None:
         self.plot_widget.setLabel("bottom", "Relative Time", units="s")
-        self.plot_widget.setLabel("left", "Value")
+        self.plot_widget.setLabel("left", self._xt_mode_label(self._xt_display_mode))
 
         if not self.selected_signal_ids:
             self.message_label.setText("Select one or more signals to draw an X-T plot.")
@@ -467,26 +607,28 @@ class Plot2DPanel(BasePlotPanel):
             if signal_id not in parsed_log.signals_by_id:
                 continue
             signal = signal_lookup[signal_id]
-            series = parsed_log.get_series(signal_id)[indices]
+            series = self._get_display_series(signal_id)[indices]
             curve = self.plot_widget.plot(
                 time_values,
                 series,
                 pen=pg.mkPen(self._series_color(order), width=2),
-                name=self._display_signal_label(signal),
+                name=self._xt_display_signal_label(signal),
             )
             self.curves.append(curve)
             all_series.append(series)
 
-        self.message_label.setText(f"X-T plot with {len(self.curves)} signal(s)")
+        self.message_label.setText(
+            f"X-T plot | {self._xt_mode_label(self._xt_display_mode)} | {len(self.curves)} signal(s)"
+        )
         if all_series:
             combined = np.concatenate(all_series)
             self._set_default_ranges(time_values, combined)
             first_signal = signal_lookup[self.selected_signal_ids[0]]
             first_index = int(indices[0])
-            first_value = float(parsed_log.get_series(self.selected_signal_ids[0])[first_index])
+            first_value = float(self._get_display_series(self.selected_signal_ids[0])[first_index])
             self._set_overlay_text(
                 self._format_overlay_rows(
-                    [(self._display_signal_label(first_signal), first_value, self._series_color(0))]
+                    [(self._xt_display_signal_label(first_signal), first_value, self._series_color(0))]
                 )
             )
 
@@ -507,8 +649,8 @@ class Plot2DPanel(BasePlotPanel):
         x_signal_id, y_signal_id = self.selected_signal_ids
         x_signal = signal_lookup[x_signal_id]
         y_signal = signal_lookup[y_signal_id]
-        x_series = parsed_log.get_series(x_signal_id)[indices]
-        y_series = parsed_log.get_series(y_signal_id)[indices]
+        x_series = self._get_display_series(x_signal_id)[indices]
+        y_series = self._get_display_series(y_signal_id)[indices]
 
         x_label = self._display_signal_label(x_signal)
         y_label = self._display_signal_label(y_signal)
@@ -713,8 +855,8 @@ class Plot2DPanel(BasePlotPanel):
         if len(self.selected_signal_ids) != 2:
             return None
 
-        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])[self._visible_indices]
-        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])[self._visible_indices]
+        x_series = self._get_display_series(self.selected_signal_ids[0])[self._visible_indices]
+        y_series = self._get_display_series(self.selected_signal_ids[1])[self._visible_indices]
         x_span = max(float(np.max(x_series) - np.min(x_series)), 1e-9)
         y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
         distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
@@ -743,28 +885,30 @@ class Plot2DPanel(BasePlotPanel):
         nearest_x = float(self.parsed_log.time_seconds[index])
         self.v_line.setPos(nearest_x)
 
-        preview_parts = [f"t={nearest_x:.4f}s"]
+        preview_parts = [self._xt_mode_suffix(self._xt_display_mode) or "Raw", f"t={nearest_x:.4f}s"]
         y_value = None
         for signal_id in self.selected_signal_ids[:3]:
-            value = float(self.parsed_log.get_series(signal_id)[index])
+            value = float(self._get_display_series(signal_id)[index])
             signal = self.signal_lookup[signal_id]
-            preview_parts.append(f"{signal.name}={value:.6f}")
+            preview_parts.append(f"{signal.name}={self._format_numeric_value(value)}")
             if y_value is None:
                 y_value = value
 
-        if y_value is not None:
+        if y_value is not None and np.isfinite(y_value):
             self.h_line.setPos(y_value)
+            self.h_line.show()
+        else:
+            self.h_line.hide()
 
         overlay_rows: list[tuple[str, float, str]] = []
         for order, signal_id in enumerate(self.selected_signal_ids[:6]):
-            value = float(self.parsed_log.get_series(signal_id)[index])
+            value = float(self._get_display_series(signal_id)[index])
             signal = self.signal_lookup[signal_id]
             color = self._series_color(order)
-            overlay_rows.append((self._display_signal_label(signal), value, color))
+            overlay_rows.append((self._xt_display_signal_label(signal), value, color))
 
         self._set_overlay_text(self._format_overlay_rows(overlay_rows))
         self.v_line.show()
-        self.h_line.show()
         self.plot_widget.viewport().update()
         self.emit_status(self._measurement_status or " | ".join(preview_parts))
 
@@ -778,8 +922,8 @@ class Plot2DPanel(BasePlotPanel):
             self._hide_cursor(broadcast=True)
             return
 
-        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])[self._visible_indices]
-        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])[self._visible_indices]
+        x_series = self._get_display_series(self.selected_signal_ids[0])[self._visible_indices]
+        y_series = self._get_display_series(self.selected_signal_ids[1])[self._visible_indices]
         x_span = max(float(np.max(x_series) - np.min(x_series)), 1e-9)
         y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
         distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
@@ -791,8 +935,8 @@ class Plot2DPanel(BasePlotPanel):
 
     def _show_xy_cursor_at_index(self, index: int) -> None:
         assert self.parsed_log is not None
-        x_series = self.parsed_log.get_series(self.selected_signal_ids[0])
-        y_series = self.parsed_log.get_series(self.selected_signal_ids[1])
+        x_series = self._get_display_series(self.selected_signal_ids[0])
+        y_series = self._get_display_series(self.selected_signal_ids[1])
         nearest_x = float(x_series[index])
         nearest_y = float(y_series[index])
 
